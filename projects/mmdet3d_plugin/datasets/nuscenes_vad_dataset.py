@@ -1090,7 +1090,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         anns_results = self.vector_map.gen_vectorized_samples(
             location, lidar2global_translation, lidar2global_rotation
         )
-        
+
         '''
         anns_results, type: dict
             'gt_vecs_pts_loc': list[num_vecs], vec with num_points*2 coordinates
@@ -1105,7 +1105,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             try:
                 gt_vecs_pts_loc = gt_vecs_pts_loc.flatten(1).to(dtype=torch.float32)
             except:
-                # empty tensor, will be passed in train, 
+                # empty tensor, will be passed in train,
                 # but we preserve it for test
                 gt_vecs_pts_loc = gt_vecs_pts_loc
 
@@ -1242,7 +1242,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             nan_mask = np.isnan(gt_velocity[:, 0])
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
-        
+
         if self.with_attr:
             gt_fut_trajs = info['gt_agent_fut_trajs'][mask]
             gt_fut_masks = info['gt_agent_fut_masks'][mask]
@@ -1259,7 +1259,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
-        
+
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
@@ -1291,7 +1291,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         # standard protocal modified from SECOND.Pytorch
         input_dict = dict(
             sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
+            pts_filename=info['lidar_path'].replace("./data/nuscenes", self.data_root.rstrip("/"), 1),
             sweeps=info['sweeps'],
             ego2global_translation=info['ego2global_translation'],
             ego2global_rotation=info['ego2global_rotation'],
@@ -1325,7 +1325,10 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             input_dict["camera2ego"] = []
             input_dict["camera_intrinsics"] = []
             for cam_type, cam_info in info['cams'].items():
-                image_paths.append(cam_info['data_path'])
+                # ==========================================#
+                image_path = cam_info['data_path']
+                image_path = image_path.replace("./data/nuscenes", self.data_root.rstrip("/"), 1)
+                image_paths.append(image_path)
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[
@@ -1341,7 +1344,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
 
                 cam_intrinsics.append(viewpad)
                 lidar2cam_rts.append(lidar2cam_rt.T)
-            
+
                 # camera to ego transform
                 camera2ego = np.eye(4).astype(np.float32)
                 camera2ego[:3, :3] = Quaternion(
@@ -1517,7 +1520,6 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                 annos.append(nusc_anno)
             nusc_annos[sample_token] = annos
 
-
             map_pred_anno = {}
             vecs = output_to_vecs(det)
             sample_token = self.data_infos[sample_id]['token']
@@ -1672,11 +1674,10 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
         detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
 
-
         from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import eval_map
         from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import format_res_gt_by_classes
         result_path = osp.abspath(result_path)
-        
+
         print('Formating results & gts by classes')
         pred_results = mmcv.load(result_path)
         map_results = pred_results['map_results']
@@ -1730,7 +1731,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                             detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
 
         return detail
-    
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1773,20 +1774,20 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         for met in result_metric_names:
             for cls in motion_cls_names:
                 result_dict[met+'_'+cls] = 0.0
-        
+
         alpha = 0.5
 
         for i in range(len(results)):
             for key in all_metric_dict.keys():
                 all_metric_dict[key] += results[i]['metric_results'][key]
-        
+
         for cls in motion_cls_names:
             result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
                  alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
             result_dict['ADE_'+cls] = all_metric_dict['ADE_'+cls] / all_metric_dict['cnt_ade_'+cls]
             result_dict['FDE_'+cls] = all_metric_dict['FDE_'+cls] / all_metric_dict['cnt_fde_'+cls]
             result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['cnt_fde_'+cls]
-        
+
         print('\n')
         print('-------------- Motion Prediction --------------')
         for k, v in result_dict.items():
@@ -1807,7 +1808,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             else:
                 for k in res['metric_results'].keys():
                     metric_dict[k] += res['metric_results'][k]
-        
+
         for k in metric_dict:
             metric_dict[k] = metric_dict[k] / num_valid
             print("{}:{}".format(k, metric_dict[k]))
