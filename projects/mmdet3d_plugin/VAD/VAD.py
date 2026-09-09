@@ -614,11 +614,6 @@ class VAD(MVXTwoStageDetector):
         future_second = 3
         assert pred_ego_fut_trajs.shape[0] == 1, 'only support bs=1'
 
-        # The ST-P3 planning metric rasterizes boxes with NumPy/OpenCV and is
-        # therefore a CPU metric.  Predictions are already copied to CPU when
-        # bbox_results are built, while GT trajectories arrive from the data
-        # scatter on the model device.  Normalize both here so L2 and collision
-        # evaluation never mix CPU and CUDA tensors.
         pred_ego_fut_trajs = pred_ego_fut_trajs.detach().cpu()
         gt_ego_fut_trajs = gt_ego_fut_trajs.detach().cpu()
 
@@ -626,17 +621,17 @@ class VAD(MVXTwoStageDetector):
             self.planning_metric = PlanningMetric()
         segmentation, pedestrian = self.planning_metric.get_label(
             gt_agent_boxes, gt_agent_feats)
-        occupancy = torch.logical_or(segmentation, pedestrian).cpu()
+        occupancy = torch.logical_or(segmentation, pedestrian)
 
         for i in range(future_second):
             if fut_valid_flag:
                 cur_time = (i+1)*2
                 traj_L2 = self.planning_metric.compute_L2(
-                    pred_ego_fut_trajs[0, :cur_time],
+                    pred_ego_fut_trajs[0, :cur_time].detach().to(gt_ego_fut_trajs.device),
                     gt_ego_fut_trajs[0, :cur_time]
                 )
                 obj_coll, obj_box_coll = self.planning_metric.evaluate_coll(
-                    pred_ego_fut_trajs[:, :cur_time],
+                    pred_ego_fut_trajs[:, :cur_time].detach(),
                     gt_ego_fut_trajs[:, :cur_time],
                     occupancy)
                 metric_dict['plan_L2_{}s'.format(i+1)] = traj_L2
