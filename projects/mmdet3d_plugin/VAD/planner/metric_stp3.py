@@ -174,6 +174,12 @@ class PlanningMetric():
                         x
         segmentation: torch.Tensor (n_future, 200, 200)
         '''
+        # Collision rasterization below uses NumPy/skimage.  Keep this helper
+        # on CPU even if it is called directly with tensors from another
+        # device.
+        traj = traj.detach().cpu()
+        segmentation = segmentation.detach().cpu()
+
         pts = np.array([
             [-self.H / 2. + 0.5, self.W / 2.],
             [self.H / 2. + 0.5, self.W / 2.],
@@ -237,7 +243,7 @@ class PlanningMetric():
         #     plt.savefig('/home/users/qing01.xu/bevformer/debug_figs/occ_metric_stp3_pred.jpg')
         # plt.close()
 
-        return torch.from_numpy(collision).to(device=traj.device)
+        return torch.from_numpy(collision)
 
     def evaluate_coll(
             self, 
@@ -257,6 +263,23 @@ class PlanningMetric():
         segmentation: torch.Tensor (B, n_future, 200, 200)
 
         '''
+        # This metric uses NumPy/OpenCV and CPU-created BEV constants.  Moving
+        # all inputs to CPU up front also keeps masks and index tensors on the
+        # same device.
+        trajs = trajs.detach().cpu()
+        gt_trajs = gt_trajs.detach().cpu()
+        segmentation = segmentation.detach().cpu()
+
+        if trajs.shape != gt_trajs.shape:
+            raise ValueError(
+                'trajs and gt_trajs must have the same shape, but got '
+                f'{tuple(trajs.shape)} and {tuple(gt_trajs.shape)}')
+        if segmentation.shape[:2] != trajs.shape[:2]:
+            raise ValueError(
+                'segmentation batch/time dimensions must match trajectories, '
+                f'but got {tuple(segmentation.shape[:2])} and '
+                f'{tuple(trajs.shape[:2])}')
+
         B, n_future, _ = trajs.shape
         # trajs = trajs * torch.tensor([-1, 1], device=trajs.device)
         # gt_trajs = gt_trajs * torch.tensor([-1, 1], device=gt_trajs.device)
@@ -275,14 +298,14 @@ class PlanningMetric():
             m1 = torch.logical_and(
                 torch.logical_and(xi >= 0, xi < self.bev_dimension[0]),
                 torch.logical_and(yi >= 0, yi < self.bev_dimension[1]),
-            ).to(gt_box_coll.device)
+            )
             m1 = torch.logical_and(m1, torch.logical_not(gt_box_coll))
 
-            ti = torch.arange(n_future)
+            ti = torch.arange(n_future, device=segmentation.device)
             obj_coll_sum[ti[m1]] += segmentation[i, ti[m1], xi[m1], yi[m1]].long()
 
             m2 = torch.logical_not(gt_box_coll)
-            box_coll = self.evaluate_single_coll(trajs[i], segmentation[i], input_gt=False).to(ti.device)
+            box_coll = self.evaluate_single_coll(trajs[i], segmentation[i], input_gt=False)
             obj_box_coll_sum[ti[m2]] += (box_coll[ti[m2]]).long()
 
         return obj_coll_sum, obj_box_coll_sum
