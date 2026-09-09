@@ -6,7 +6,7 @@ import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from mmdet.models import HEADS, build_loss 
+from mmdet.models import HEADS, build_loss
 from mmdet.models.dense_heads import DETRHead
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import TORCH_VERSION, digit_version
@@ -240,7 +240,7 @@ class VADHead(DETRHead):
             if 'bg_cls_weight' in loss_map_cls:
                 loss_map_cls.pop('bg_cls_weight')
             self.map_bg_cls_weight = map_bg_cls_weight
-        
+
         self.traj_bg_cls_weight = 0
 
         super(VADHead, self).__init__(*args, transformer=transformer, **kwargs)
@@ -248,7 +248,7 @@ class VADHead(DETRHead):
             self.code_weights, requires_grad=False), requires_grad=False)
         self.map_code_weights = nn.Parameter(torch.tensor(
             self.map_code_weights, requires_grad=False), requires_grad=False)
-        
+
         if kwargs['train_cfg'] is not None:
             assert 'map_assigner' in kwargs['train_cfg'], 'map assigner should be provided '\
                 'when train_cfg is set.'
@@ -270,7 +270,7 @@ class VADHead(DETRHead):
             # DETR sampling=False, so use PseudoSampler
             sampler_cfg = dict(type='PseudoSampler')
             self.map_sampler = build_sampler(sampler_cfg, context=self)
-        
+
         self.loss_traj = build_loss(loss_traj)
         self.loss_traj_cls = build_loss(loss_traj_cls)
         self.loss_map_bbox = build_loss(loss_map_bbox)
@@ -376,6 +376,7 @@ class VADHead(DETRHead):
                 self.bev_h * self.bev_w, self.embed_dims)
             self.query_embedding = nn.Embedding(self.num_query,
                                                 self.embed_dims * 2)
+            #* Map Query 构造：
             if self.map_query_embed_type == 'all_pts':
                 self.map_query_embedding = nn.Embedding(self.map_num_query,
                                                     self.embed_dims * 2)
@@ -383,10 +384,10 @@ class VADHead(DETRHead):
                 self.map_query_embedding = None
                 self.map_instance_embedding = nn.Embedding(self.map_num_vec, self.embed_dims * 2)
                 self.map_pts_embedding = nn.Embedding(self.map_num_pts_per_vec, self.embed_dims * 2)
-        
+
         if self.motion_decoder is not None:
             self.motion_decoder = build_transformer_layer_sequence(self.motion_decoder)
-            self.motion_mode_query = nn.Embedding(self.fut_mode, self.embed_dims)	
+            self.motion_mode_query = nn.Embedding(self.fut_mode, self.embed_dims)
             self.motion_mode_query.weight.requires_grad = True
             if self.use_pe:
                 self.pos_mlp_sa = nn.Linear(2, self.embed_dims)
@@ -398,11 +399,11 @@ class VADHead(DETRHead):
             self.motion_map_decoder = build_transformer_layer_sequence(self.motion_map_decoder)
             if self.use_pe:
                 self.pos_mlp = nn.Linear(2, self.embed_dims)
-        
+
         if self.ego_his_encoder is not None:
             self.ego_his_encoder = LaneNet(2, self.embed_dims//2, 3)
         else:
-            self.ego_query = nn.Embedding(1, self.embed_dims)	
+            self.ego_query = nn.Embedding(1, self.embed_dims)
 
         if self.ego_agent_decoder is not None:
             self.ego_agent_decoder = build_transformer_layer_sequence(self.ego_agent_decoder)
@@ -492,7 +493,7 @@ class VADHead(DETRHead):
                 network, each is a 5D-tensor with shape
                 (B, N, C, H, W).
             prev_bev: previous bev featues
-            only_bev: only compute BEV features with encoder. 
+            only_bev: only compute BEV features with encoder.
         Returns:
             all_cls_scores (Tensor): Outputs from the classification head, \
                 shape [nb_dec, bs, num_query, cls_out_channels]. Note \
@@ -500,12 +501,30 @@ class VADHead(DETRHead):
             all_bbox_preds (Tensor): Sigmoid outputs from the regression \
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
+
+        整体流程：
+            1. 构造 BEV、目标（agent）和地图（map）三类查询；
+            2. Transformer 将多视角图像投影到 BEV，并解码目标与地图实例；
+            3. 基于目标查询预测每个 agent 的多模态未来轨迹；
+            4. ego query 依次与 agent、map 查询交互，预测自车未来轨迹。
         """
-        
+
+        #*==================== 1. 构造 BEV / Agent / Map Queries ====================#
+        #* BEV Query：对应 BEV 网格中的固定位置，从多相机图像中聚合空间特征，形成鸟瞰图表示。
+        #* Agent Query：对应潜在的动态交通参与者，用于预测目标类别、3D 框及多模态未来轨迹。
+        #* Map Query：对应矢量地图实例及其采样点，用于预测车道线、道路边界等地图元素。
+        #* 三者均为可学习查询；Agent/Map Query 初始只是候选槽位，训练匹配后才学习表示具体实例。
+        # mlvl_feats 中每一层特征的形状为 [B, N_cam, C, H, W]。
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
+
+        # 目标查询（论文中的 agent queries）：用于检测场景中的动态交通参与者。
         object_query_embeds = self.query_embedding.weight.to(dtype)
-        
+
+        # 地图查询（map queries）有两种构造方式：
+        # 1) all_pts：直接学习 [V*P,2D]，每个地图采样点都有独立的完整查询；
+        # 2) instance_pts：学习 [V,2D] 实例查询和 [P,2D] 点查询，通过广播相加得到
+        #    [V,P,2D]，再展平为 [V*P,2D]；同一实例内的 P 个点共享实例身份信息。
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
         elif self.map_query_embed_type == 'instance_pts':
@@ -513,12 +532,16 @@ class VADHead(DETRHead):
             map_instance_embeds = self.map_instance_embedding.weight.unsqueeze(1)
             map_query_embeds = (map_pts_embeds + map_instance_embeds).flatten(0, 1).to(dtype)
 
+        # BEV 网格上的可学习查询，用它们从多相机图像特征中聚合 BEV 特征。
         bev_queries = self.bev_embedding.weight.to(dtype)
 
+        # 为 BEV 网格生成位置编码，使查询带有二维空间位置信息。
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
-            
+
+        #*==================== 2. 图像特征投影与 Transformer 解码 ====================#
+        # 处理历史帧时只运行 BEV Encoder，返回的 BEV 会作为当前帧的 prev_bev。
         if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
             return self.transformer.get_bev_features(
                 mlvl_feats,
@@ -532,27 +555,43 @@ class VADHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            #* 完整 Transformer 前向：图像特征 -> BEV 表示 -> Agent/Map 实例表示。
+            # 具体进入 VAD_transformer.py 中 VADPerceptionTransformer.forward()：
+            # 1) get_bev_features() 通过 BEV Encoder 聚合多相机特征并融合 prev_bev；
+            # 2) decoder 以 object_query_embeds 为查询，解码动态 Agent；
+            # 3) map_decoder 以 map_query_embeds 为查询，解码矢量地图元素。
             outputs = self.transformer(
-                mlvl_feats,
-                bev_queries,
-                object_query_embeds,
-                map_query_embeds,
-                self.bev_h,
-                self.bev_w,
+                mlvl_feats,          # 多尺度、多相机图像特征，各层为 [B, N_cam, D, H, W]
+                bev_queries,         # BEV 网格查询，[bev_h*bev_w, D]
+                object_query_embeds, # Agent 查询（内容+位置编码），[A, 2D]
+                map_query_embeds,    # Map 点查询（内容+位置编码），[V*P, 2D]
+                self.bev_h,          # BEV 网格高度
+                self.bev_w,          # BEV 网格宽度
+                # 每个 BEV 网格在真实坐标系中对应的高、宽尺寸。
                 grid_length=(self.real_h / self.bev_h,
                              self.real_w / self.bev_w),
-                bev_pos=bev_pos,
+                bev_pos=bev_pos,     # BEV 二维位置编码，[B, D, bev_h, bev_w]
+                # 向 decoder 传入回归/分类分支，用于逐层更新 reference points。
                 reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
                 cls_branches=self.cls_branches if self.as_two_stage else None,
                 map_reg_branches=self.map_reg_branches if self.with_box_refine else None,  # noqa:E501
                 map_cls_branches=self.map_cls_branches if self.as_two_stage else None,
-                img_metas=img_metas,
-                prev_bev=prev_bev
-        )
+                img_metas=img_metas, # 相机标定、ego 位姿、can_bus 等样本元信息
+                prev_bev=prev_bev    # 上一时刻的 BEV 特征，用于时序融合
+            )
 
-        bev_embed, hs, init_reference, inter_references, \
-            map_hs, map_init_reference, map_inter_references = outputs
+        #* 拆分 Transformer 输出；每个返回值使用的维度缩写紧跟在对应 shape 后解释。
+        (
+            bev_embed,             # BEV memory，[HW,B,D]；HW=bev_h*bev_w，B=批大小，D=特征维度
+            hs,                    # Agent特征，[Ld,A,B,D]；Ld=Agent解码层数，A=Agent Query数，B=批大小，D=特征维度
+            init_reference,        # Agent初始点(x,y,z)，[B,A,3]；B=批大小，A=Agent Query数
+            inter_references,      # Agent更新点，[Ld,B,A,3]；Ld=Agent解码层数，B=批大小，A=Agent Query数
+            map_hs,                # Map点特征，[Lm,V*P,B,D]；Lm=Map解码层数，V=实例数，P=每实例点数，B=批大小，D=特征维度
+            map_init_reference,    # Map初始点(x,y)，[B,V*P,2]；B=批大小，V=地图实例数，P=每实例点数
+            map_inter_references,  # Map更新点，[Lm,B,V*P,2]；Lm=Map解码层数，B=批大小，V=实例数，P=每实例点数
+        ) = outputs
 
+        # Decoder 返回 query-first 布局；转换为 batch-first：[Ld,A,B,D] -> [Ld,B,A,D]。
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
         outputs_coords = []
@@ -560,254 +599,469 @@ class VADHead(DETRHead):
         outputs_trajs = []
         outputs_trajs_classes = []
 
+        # Map 分支同样转为 batch-first：[Lm,V*P,B,D] -> [Lm,B,V*P,D]。
         map_hs = map_hs.permute(0, 2, 1, 3)
         map_outputs_classes = []
         map_outputs_coords = []
         map_outputs_pts_coords = []
         map_outputs_coords_bev = []
 
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+        #*==================== 3. Agent 检测分支 ====================#
+        #* 每层都基于 Agent Query 预测类别与 3D 框，并围绕上一层参考点细化中心位置。
+        for lvl in range(hs.shape[0]):  # 遍历 Ld 个 Agent Decoder 层
+            if lvl == 0:  # 第 0 层尚无上一层结果
+                reference = init_reference  # 初始参考点，[B,A,3]，最后一维为归一化 (x,y,z)
+            else:  # 第 lvl 层使用第 lvl-1 层已经细化的参考点
+                reference = inter_references[lvl - 1]  # [B,A,3]
+            # 将 [0,1] 参考点映射到 logit 空间，使回归头可以用无界残差进行位置修正。
+            reference = inverse_sigmoid(reference)  # [B,A,3]
+            # 分类头把当前层 Agent 特征映射为类别 logits；Ca 包含前景类别及背景处理所需通道。
+            outputs_class = self.cls_branches[lvl](hs[lvl])  # [B,A,D] -> [B,A,Ca]
+            # 回归头输出 3D 框编码，默认 code_size=10。
+            tmp = self.reg_branches[lvl](hs[lvl])  # [B,A,D] -> [B,A,code_size]
 
-            # TODO: check the shape of reference
-            assert reference.shape[-1] == 3
-            tmp[..., 0:2] = tmp[..., 0:2] + reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            outputs_coords_bev.append(tmp[..., 0:2].clone().detach())
-            tmp[..., 4:5] = tmp[..., 4:5] + reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+            #* 默认框编码为 (cx,cy,log(w),log(l),cz,log(h),sin(yaw),cos(yaw),vx,vy)。
+            assert reference.shape[-1] == 3  # Agent 参考点必须包含归一化 x、y、z
+            # 在 logit 空间把预测的 x/y 偏移加到参考点 x/y 上，完成残差式中心细化。
+            tmp[..., 0:2] = tmp[..., 0:2] + reference[..., 0:2]  # [B,A,2]
+            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()  # 细化后的 x/y 映射回 [0,1]
+            # 保存归一化 BEV 中心供运动预测和规划使用；detach 阻止这些分支经中心坐标
+            # 反向影响检测框回归分支，但 Agent Query 特征本身仍参与后续分支训练。
+            outputs_coords_bev.append(tmp[..., 0:2].clone().detach())  # 每层一个 [B,A,2]
+            # z 中心存放在框编码索引 4，同样在 logit 空间结合参考点 z 做残差细化。
+            tmp[..., 4:5] = tmp[..., 4:5] + reference[..., 2:3]  # [B,A,1]
+            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()  # 细化后的 z 映射回 [0,1]
+            #* 将归一化中心坐标反归一化到 pc_range 定义的真实三维感知范围。
             tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
+                             self.pc_range[0]) + self.pc_range[0])  # x：[0,1] -> [x_min,x_max]
             tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
+                             self.pc_range[1]) + self.pc_range[1])  # y：[0,1] -> [y_min,y_max]
             tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
+                             self.pc_range[2]) + self.pc_range[2])  # z：[0,1] -> [z_min,z_max]
 
-            # TODO: check if using sigmoid
-            outputs_coord = tmp
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
-        
+            # w/l/h、朝向和速度等其余维度保持回归头的编码形式，之后由 bbox coder 解码。
+            outputs_coord = tmp  # 当前层完整 3D 框编码，[B,A,code_size]
+            outputs_classes.append(outputs_class)  # 收集当前层类别 logits
+            outputs_coords.append(outputs_coord)  # 收集当前层 3D 框预测
+
+        #*==================== 4. 矢量地图分支 ====================#
+        #* “有序点”是沿折线依次排列的 P 个二维坐标 (x_i,y_i)，不是额外预测的方向矢量。
+        #* V 个地图实例 query 各自包含 P 个 Map Point Query，因此 Map Decoder 每层共有
+        #* V*P 个点特征。该分支同时产生实例级类别、实例包围框和折线点集三类输出。
+        # 点序描述折线连接关系：p0 -> p1 -> ... -> p(P-1)。这里是预测结果生成阶段；
+        # 训练时各 decoder 层均参与监督，推理时 bbox coder 通常使用最后一层结果解码。
         for lvl in range(map_hs.shape[0]):
+            # map_hs=[Lm,B,V*P,D]，当前层点特征 map_hs[lvl]=[B,V*P,D]。
             if lvl == 0:
-                reference = map_init_reference
+                # 第 0 层以 Map Query 初始化得到的二维参考点作为坐标回归基准。
+                reference = map_init_reference  # [B,V*P,2]，归一化 (x,y)
             else:
-                reference = map_inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
+                # 后续层使用前一 decoder 层细化后的参考点，实现逐层迭代修正。
+                reference = map_inter_references[lvl - 1]  # [B,V*P,2]
+            # reference 位于 [0,1]；转到 logit 空间后才能与回归头输出的残差直接相加。
+            reference = inverse_sigmoid(reference)  # [B,V*P,2]
+
+            #*==================== 4.1 地图实例分类 ====================#
+            # 先把 V*P 个点特征恢复为 V 个实例、每实例 P 个点：[B,V,P,D]。
+            # 沿 P 维取均值得到每条折线的实例特征 [B,V,D]，再预测实例类别。
             map_outputs_class = self.map_cls_branches[lvl](
-                map_hs[lvl].view(bs,self.map_num_vec, self.map_num_pts_per_vec,-1).mean(2)
-            )
-            tmp = self.map_reg_branches[lvl](map_hs[lvl])
-            # TODO: check the shape of reference
+                map_hs[lvl]
+                .view(bs, self.map_num_vec, self.map_num_pts_per_vec, -1)
+                .mean(2))  # [B,V,Cm]；Cm=地图类别输出通道数
+
+            #*==================== 4.2 地图有序点坐标回归 ====================#
+            # 每个 Map Point Query 独立预测相对参考点的坐标残差；当前配置最终使用前两维。
+            tmp = self.map_reg_branches[lvl](map_hs[lvl])  # [B,V*P,map_code_size]
+            # 地图参考点是 BEV 平面上的二维坐标，而非 Agent 分支使用的三维 (x,y,z) 参考点。
             assert reference.shape[-1] == 2
-            tmp[..., 0:2] += reference[..., 0:2]
-            tmp = tmp.sigmoid() # cx,cy,w,h
+            # 在 inverse-sigmoid/logit 空间将预测残差叠加到当前层参考点，实现坐标细化。
+            tmp[..., 0:2] += reference[..., 0:2]  # [B,V*P,2]
+            # 映射回归一化 BEV 坐标范围；每个点得到 (x,y)，并未额外预测方向向量。
+            tmp = tmp.sigmoid()  # 当前 VAD 配置下为 [B,V*P,2]
+
+            #*==================== 4.3 组织折线并派生实例包围框 ====================#
+            # map_transform_box() 将 V*P 个点恢复为 V 条折线，并根据每条折线所有点的
+            # xmin/xmax/ymin/ymax 派生包围框，而不是再使用一个独立 bbox 回归头。
             map_outputs_coord, map_outputs_pts_coord = self.map_transform_box(tmp)
-            map_outputs_coords_bev.append(map_outputs_pts_coord.clone().detach())
-            map_outputs_classes.append(map_outputs_class)
-            map_outputs_coords.append(map_outputs_coord)
-            map_outputs_pts_coords.append(map_outputs_pts_coord)
-            
+            # map_outputs_coord=[B,V,4]，格式为归一化 (cx,cy,w,h)。
+            # map_outputs_pts_coord=[B,V,P,2]，保存每个地图实例的 P 个归一化有序点。
+            # detach 后的点只作为后续 motion/planning 位置编码，不让这些分支经坐标旁路
+            # 反向修改地图点回归；地图自身的点/框损失仍通过下方原始输出正常反传。
+            map_outputs_coords_bev.append(
+                map_outputs_pts_coord.clone().detach())  # 第 lvl 层地图点位置缓存
+            map_outputs_classes.append(map_outputs_class)  # 实例类别：[B,V,Cm]
+            map_outputs_coords.append(map_outputs_coord)  # 实例包围框：[B,V,4]
+            map_outputs_pts_coords.append(map_outputs_pts_coord)  # 有序点：[B,V,P,2]
+
+        #*==================== 5. Agent 多模态运动预测分支 ====================#
+        #* 本分支为前面 3D 检测分支的全部 A 个 Agent Query 预测运动，不预测自车或地图。
+        #* “多模态”表示每个 Agent 同时保留 K=fut_mode 种可能未来（如直行、转弯、变道），
+        #* 并非相机/激光雷达等传感器模态；总运动查询数 Qm=A*K。
+        #* 流程：Agent Query + Mode Query -> Agent-Agent 自注意力 -> Agent-Map 交叉注意力
+        #*      -> 得到 [B,A,K,2D] 运动特征，后续再回归 K 条轨迹及其模态分数。
         if self.motion_decoder is not None:
-            batch_size, num_agent = outputs_coords_bev[-1].shape[:2]
-            # motion_query
-            motion_query = hs[-1].permute(1, 0, 2)  # [A, B, D]
-            mode_query = self.motion_mode_query.weight  # [fut_mode, D]
-            # [M, B, D], M=A*fut_mode
-            motion_query = (motion_query[:, None, :, :] + mode_query[None, :, None, :]).flatten(0, 1)
+            # 最后一层检测结果为运动预测提供 Agent 数量和归一化 BEV 中心位置。
+            batch_size, num_agent = outputs_coords_bev[-1].shape[:2]  # B, A
+
+            #*==================== 5.1 为每个 Agent 构造 K 个运动模态 Query ====================#
+            # hs[-1]=[B,A,D] 是最后一层 Agent Decoder 特征；转为 Transformer 的 query-first。
+            motion_query = hs[-1].permute(1, 0, 2)  # [A,B,D]
+            # K 个全局可学习 Mode Query 用于区分同一 Agent 的 K 种可能未来行为。
+            mode_query = self.motion_mode_query.weight  # [K,D]，K=fut_mode
+            # [A,1,B,D]+[1,K,1,D] -> [A,K,B,D] -> [Qm,B,D]，Qm=A*K。
+            # 注意：这里对全部 A 个检测 Query 都构造运动 Query，尚未删除低分目标。
+            motion_query = (
+                motion_query[:, None, :, :] + mode_query[None, :, None, :]
+            ).flatten(0, 1)  # [Qm,B,D]
+
+            # 可选位置编码：同一 Agent 的 K 个模态共享该 Agent 的当前 BEV 中心位置。
             if self.use_pe:
-                motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
-                motion_pos = self.pos_mlp_sa(motion_coords)  # [B, A, D]
-                motion_pos = motion_pos.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
-                motion_pos = motion_pos.permute(1, 0, 2)  # [M, B, D]
+                motion_coords = outputs_coords_bev[-1]  # [B,A,2]，归一化 Agent 中心 (x,y)
+                motion_pos = self.pos_mlp_sa(motion_coords)  # [B,A,D]
+                # [B,A,D] -> [B,A,K,D] -> [B,Qm,D]，复制位置而不复制 Agent 语义特征。
+                motion_pos = motion_pos.unsqueeze(2).repeat(
+                    1, 1, self.fut_mode, 1).flatten(1, 2)  # [B,Qm,D]
+                motion_pos = motion_pos.permute(1, 0, 2)  # [Qm,B,D]
             else:
                 motion_pos = None
 
+            #*==================== 5.2 依据检测分数屏蔽不可靠的交互对象 ====================#
             if self.motion_det_score is not None:
-                motion_score = outputs_classes[-1]
-                max_motion_score = motion_score.max(dim=-1)[0]
+                # 使用最后一层检测分类输出，取每个 Agent 在所有类别中的最大得分。
+                motion_score = outputs_classes[-1]  # [B,A,Ca]，Ca=Agent 类别通道数
+                max_motion_score = motion_score.max(dim=-1)[0]  # [B,A]
+                # True 表示该 Agent 低于阈值；每个 Agent 的 K 个模态使用同一个有效标记。
                 invalid_motion_idx = max_motion_score < self.motion_det_score  # [B, A]
-                invalid_motion_idx = invalid_motion_idx.unsqueeze(2).repeat(1, 1, self.fut_mode).flatten(1, 2)
+                invalid_motion_idx = invalid_motion_idx.unsqueeze(2).repeat(
+                    1, 1, self.fut_mode).flatten(1, 2)  # [B,Qm]
             else:
                 invalid_motion_idx = None
 
+            #*==================== 5.3 Agent-Agent 自注意力交互 ====================#
+            # Q=K=V 均为全部 Qm 个运动 Query，使不同交通参与者及不同未来模态相互建模。
+            # key_padding_mask 只阻止低分 Agent 作为 key/value 被其他 query 关注；
+            # 它们的 query 张量并未从计算中删除，仍会保留对应输出位置。
             motion_hs = self.motion_decoder(
-                query=motion_query,
-                key=motion_query,
-                value=motion_query,
-                query_pos=motion_pos,
-                key_pos=motion_pos,
-                key_padding_mask=invalid_motion_idx)
+                query=motion_query,                  # [Qm,B,D]
+                key=motion_query,                    # [Qm,B,D]
+                value=motion_query,                  # [Qm,B,D]
+                query_pos=motion_pos,                # [Qm,B,D] 或 None
+                key_pos=motion_pos,                  # [Qm,B,D] 或 None
+                key_padding_mask=invalid_motion_idx) # [B,Qm] 或 None
+            # motion_hs=[Qm,B,D]：融合其他 Agent/模态后的运动交互特征。
 
+            #*==================== 5.4 Agent-Map 局部交叉注意力 ====================#
             if self.motion_map_decoder is not None:
-                # map preprocess
+                # 每个 Agent 的 K 个运动模态共享当前中心坐标，作为局部地图筛选中心。
                 motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
-                motion_coords = motion_coords.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
-                map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
-                map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
-                map_score = map_outputs_classes[-1]
-                map_pos = map_outputs_coords_bev[-1]
+                motion_coords = motion_coords.unsqueeze(2).repeat(
+                    1, 1, self.fut_mode, 1).flatten(1, 2)  # [B,Qm,2]
+                # 将每个地图实例的 P 个 Map Point 特征编码为一个实例级 Lane Query。
+                map_query = map_hs[-1].view(
+                    batch_size, self.map_num_vec,
+                    self.map_num_pts_per_vec, -1)  # [B,V,P,D]
+                map_query = self.lane_encoder(map_query)  # [B,V,D]
+                map_score = map_outputs_classes[-1]  # [B,V,Cm]，地图实例分类输出
+                map_pos = map_outputs_coords_bev[-1]  # [B,V,P,2]，地图折线点坐标
+                # 对每个 Agent-模态对筛选：①分数高于 map_thresh；②距离小于 dis_thresh。
+                # 再将不同数量的局部地图补齐到 L 条，返回 mask 标识 padding/远距离地图。
                 map_query, map_pos, key_padding_mask = self.select_and_pad_pred_map(
                     motion_coords, map_query, map_score, map_pos,
                     map_thresh=self.map_thresh, dis_thresh=self.dis_thresh,
                     pe_normalization=self.pe_normalization, use_fix_pad=True)
-                map_query = map_query.permute(1, 0, 2)  # [P, B*M, D]
-                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
+                # 返回 map_query/map_pos=[B*Qm,L,D/2]，mask=[B*Qm,L]；L=补齐后的地图数。
+                map_query = map_query.permute(1, 0, 2)  # [L,B*Qm,D]
+                # 把每个 Agent-模态对视为独立 batch，每个 batch 仅含 1 个运动 query。
+                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(
+                    0, 1).unsqueeze(0)  # [1,B*Qm,D]
 
-                # position encoding
+                #* 位置编码使用以 Agent 为原点的相对地图坐标；运动 query 位于局部原点 (0,0)。
                 if self.use_pe:
-                    (num_query, batch) = ca_motion_query.shape[:2] 
-                    motion_pos = torch.zeros((num_query, batch, 2), device=motion_hs.device)
-                    motion_pos = self.pos_mlp(motion_pos)
-                    map_pos = map_pos.permute(1, 0, 2)
-                    map_pos = self.pos_mlp(map_pos)
+                    (num_query, batch) = ca_motion_query.shape[:2]
+                    motion_pos = torch.zeros(
+                        (num_query, batch, 2), device=motion_hs.device)  # [1,B*Qm,2]
+                    motion_pos = self.pos_mlp(motion_pos)  # [1,B*Qm,D]
+                    map_pos = map_pos.permute(1, 0, 2)  # [L,B*Qm,2]
+                    map_pos = self.pos_mlp(map_pos)  # [L,B*Qm,D]
                 else:
                     motion_pos, map_pos = None, None
-                
-                ca_motion_query = self.motion_map_decoder(
-                    query=ca_motion_query,
-                    key=map_query,
-                    value=map_query,
-                    query_pos=motion_pos,
-                    key_pos=map_pos,
-                    key_padding_mask=key_padding_mask)
-            else:
-                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
 
-            batch_size = outputs_coords_bev[-1].shape[0]
+                # 运动 query 作为 Q，附近地图实例作为 K/V，注入车道线、边界等道路结构。
+                ca_motion_query = self.motion_map_decoder(
+                    query=ca_motion_query,             # [1,B*Qm,D]
+                    key=map_query,                     # [L,B*Qm,D]
+                    value=map_query,                   # [L,B*Qm,D]
+                    query_pos=motion_pos,              # [1,B*Qm,D] 或 None
+                    key_pos=map_pos,                   # [L,B*Qm,D] 或 None
+                    key_padding_mask=key_padding_mask) # [B*Qm,L]
+                # ca_motion_query=[1,B*Qm,D]：每个运动模态融合其局部地图后的特征。
+            else:
+                # 未配置地图交互时，直接把 Agent-Agent 特征作为对应的地图交互分支特征。
+                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)  # [1,B*Qm,D]
+
+            #*==================== 5.5 恢复 Agent/模态维并融合两类上下文 ====================#
+            # [Qm,B,D] -> [B,Qm,D] -> [B,A,K,D]。
+            batch_size = outputs_coords_bev[-1].shape[0]  # B
             motion_hs = motion_hs.permute(1, 0, 2).unflatten(
                 dim=1, sizes=(num_agent, self.fut_mode)
-            )
+            )  # [B,A,K,D]，Agent-Agent 交互特征
+            # [1,B*Qm,D] -> [B*Qm,D] -> [B,A,K,D]。
             ca_motion_query = ca_motion_query.squeeze(0).unflatten(
                 dim=0, sizes=(batch_size, num_agent, self.fut_mode)
-            )
-            motion_hs = torch.cat([motion_hs, ca_motion_query], dim=-1)  # [B, A, fut_mode, 2D]
+            )  # [B,A,K,D]，Agent-Map 交互特征
+            # 拼接两类上下文，供后续轨迹回归头和模态分类头使用。
+            motion_hs = torch.cat(
+                [motion_hs, ca_motion_query], dim=-1)  # [B,A,K,2D]
         else:
             raise NotImplementedError('Not implement yet')
 
-        outputs_traj = self.traj_branches[0](motion_hs)
-        outputs_trajs.append(outputs_traj)
-        outputs_traj_class = self.traj_cls_branches[0](motion_hs)
-        outputs_trajs_classes.append(outputs_traj_class.squeeze(-1))
-        (batch, num_agent) = motion_hs.shape[:2]
-             
-        map_outputs_classes = torch.stack(map_outputs_classes)
-        map_outputs_coords = torch.stack(map_outputs_coords)
-        map_outputs_pts_coords = torch.stack(map_outputs_pts_coords)
+        #*==================== 6. Agent 轨迹回归与模态分类 ====================#
+        #*==================== 与第 5 节的关系 ====================#
+        #* 第 5 节负责“理解场景并生成运动特征”：为每个 Agent 构造 K 个可能未来，
+        #* 依次注入 Agent-Agent 交互信息和 Agent-Map 道路约束，最终得到 motion_hs。
+        #* 第 6 节负责“把运动特征变成可监督、可输出的数值”：使用两个并行 MLP，
+        #* 一个回答每种模态“未来各时刻移动多少”，另一个回答“该模态有多可能”。
+        #*
+        #* 第5节输出 motion_hs=[B,A,K,2D]
+        #*        ├─ traj_branches    -> 第6节轨迹位移 [B,A,K,T*2]
+        #*        └─ traj_cls_branches-> 第6节模态分数 [B,A,K]
+        #*
+        #* 因此，第 5 节的输出就是第 6 节两个预测头的共同输入；第 6 节不再执行
+        #* Agent-Agent/Agent-Map 注意力，也不重新生成运动模态，只负责最终数值预测。
+        # B=批大小，A=Agent Query 数，K=fut_mode，T=fut_ts，D=基础特征维度；
+        # motion_hs 最后一维 2D 来自第 5 节两路 D 维上下文特征的拼接。
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
-        outputs_trajs = torch.stack(outputs_trajs)
-        outputs_trajs_classes = torch.stack(outputs_trajs_classes)
+        #*==================== 6.1 回归每种模态的未来二维轨迹 ====================#
+        # 对第 5 节产生的每个 [Agent,运动模态] 特征独立应用同一个轨迹回归 MLP；
+        # traj_branches[0] 的末层将 2D 维运动特征映射为 T*2 个数。
+        # 每个未来时刻输出二维增量 (delta_x,delta_y)，而不是全局绝对坐标。
+        # 它回答的是：“在该运动模态下，这个 Agent 接下来具体往哪里走？”
+        outputs_traj = self.traj_branches[0](motion_hs)  # [B,A,K,T*2]
+        # 保持列表形式以兼容多层输出接口；当前实现只运行一次运动预测头，列表长度为 1。
+        outputs_trajs.append(outputs_traj)  # list{[B,A,K,T*2]}
 
-        # planning
-        (batch, num_agent) = motion_hs.shape[:2]
+        #*==================== 6.2 预测 K 条候选轨迹的模态分数 ====================#
+        # 与轨迹回归头并行，模态分类头读取同一份第 5 节运动特征，为每个模态输出 logit；
+        # 它回答的是：“这个 Agent 的 K 种候选未来中，哪一种更可能发生？”
+        # 该分数是轨迹模态可信度，而不是 Agent 的车辆/行人检测类别。
+        outputs_traj_class = self.traj_cls_branches[0](motion_hs)  # [B,A,K,1]
+        # 去掉末尾大小为 1 的分类通道，得到每个 Agent 的 K 个模态 logits。
+        outputs_trajs_classes.append(
+            outputs_traj_class.squeeze(-1))  # list{[B,A,K]}
+        # 取出 B 和 A，供后续自车规划分支组织 Agent 维度；此处不进行目标筛选。
+        (batch, num_agent) = motion_hs.shape[:2]  # batch=B，num_agent=A
+
+        #*==================== 6.3 堆叠 Map Decoder 各层预测 ====================#
+        # 前面的 map for-loop 每层向列表加入一个张量；torch.stack 在最前面新增
+        # Map Decoder 层维 Lm，使训练时能够对各层施加辅助监督。
+        map_outputs_classes = torch.stack(
+            map_outputs_classes)  # [Lm,B,V,Cm]：地图实例类别 logits
+        map_outputs_coords = torch.stack(
+            map_outputs_coords)  # [Lm,B,V,4]：归一化地图包围框 (cx,cy,w,h)
+        map_outputs_pts_coords = torch.stack(
+            map_outputs_pts_coords)  # [Lm,B,V,P,2]：地图实例有序点 (x,y)
+
+        #*==================== 6.4 堆叠 Agent 检测与运动预测 ====================#
+        # Agent Decoder 的 Ld 层分别产生分类和 3D 框结果，stack 后保留层维用于辅助损失。
+        outputs_classes = torch.stack(
+            outputs_classes)  # [Ld,B,A,Ca]：Agent 检测类别 logits
+        outputs_coords = torch.stack(
+            outputs_coords)  # [Ld,B,A,code_size]：Agent 3D 框编码
+        # 运动头当前只执行一次，因此 stack 后首维暂时为 1，而不是 Ld。
+        outputs_trajs = torch.stack(
+            outputs_trajs)  # [1,B,A,K,T*2]：各模态未来逐步二维位移
+        outputs_trajs_classes = torch.stack(
+            outputs_trajs_classes)  # [1,B,A,K]：各轨迹模态 logits
+        # 后面构造 outs 时会把这份运动结果 repeat 为 Ld 份，以对齐各 Agent Decoder 层；
+        # 这只是接口和辅助监督维度复制，并不表示运动 Decoder 实际运行了 Ld 次。
+
+        #*==================== 7. 自车规划分支 ====================#
+        #* 本分支预测自车（Ego）未来轨迹，与第 5~6 节预测其他交通参与者不同。
+        #* 它先建立一个 Ego Query，再依次让它读取动态 Agent 和静态 Map 信息，最后融合
+        #* 可选的自车历史/状态，由 Planning Head 输出与高层驾驶指令对应的多条规划轨迹。
+        #* 流程：Ego初始化 -> Ego-Agent交互 -> Ego-Map交互 -> 拼接自车状态 -> 规划轨迹。
+        # B=批大小，A=Agent Query 数，K=fut_mode，V=地图实例数，P=地图点数，D=特征维度。
+        (batch, num_agent) = motion_hs.shape[:2]  # B, A
+
+        #*==================== 7.1 使用自车历史或可学习向量初始化 Ego Query ====================#
         if self.ego_his_encoder is not None:
-            ego_his_feats = self.ego_his_encoder(ego_his_trajs)  # [B, 1, dim]
+            # 将自车历史二维轨迹编码成一个实例级特征，使 Ego Query 包含自身运动趋势。
+            # ego_his_trajs 通常为 [B,1,T_his,2]；LaneNet 沿历史点维聚合。
+            ego_his_feats = self.ego_his_encoder(ego_his_trajs)  # [B,1,D]
         else:
-            ego_his_feats = self.ego_query.weight.unsqueeze(0).repeat(batch, 1, 1)
-        # Interaction
-        ego_query = ego_his_feats
-        ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
-        ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
-        agent_conf = outputs_classes[-1]
-        agent_query = motion_hs.reshape(batch, num_agent, -1)
-        agent_query = self.agent_fus_mlp(agent_query) # [B, A, fut_mode, 2*D] -> [B, A, D]
-        agent_pos = outputs_coords_bev[-1]
+            # 未配置历史编码器时，用所有样本共享的单个可学习向量表示自车初始语义。
+            ego_his_feats = self.ego_query.weight.unsqueeze(0).repeat(
+                batch, 1, 1)  # [B,1,D]
+
+        #*==================== 7.2 Ego-Agent：融合动态目标及其多模态运动 ====================#
+        ego_query = ego_his_feats  # [B,1,D]，交叉注意力中唯一的 query
+        # 以自车为坐标原点建立 Ego 位置编码；1 表示每个样本只有一个自车 query。
+        ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)  # [B,1,2]
+        ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)  # [B,1,D]
+        # 最后一层 3D 检测分类 logits 用于筛除低置信度 Agent Query。
+        agent_conf = outputs_classes[-1]  # [B,A,Ca]
+        # 第 5 节输出 motion_hs=[B,A,K,2D]；先把一个 Agent 的 K 个可能未来展平，
+        # 再用 agent_fus_mlp 聚合为一个实例级动态特征，使其同时包含多模态运动信息。
+        agent_query = motion_hs.reshape(batch, num_agent, -1)  # [B,A,K*2D]
+        agent_query = self.agent_fus_mlp(agent_query)  # [B,A,D]
+        agent_pos = outputs_coords_bev[-1]  # [B,A,2]，Agent 当前 BEV 中心
+        # select_and_pad_query() 对分类分数做 sigmoid 并按 query_thresh 筛选 Agent；
+        # batch 内保留数不同，因此补齐为 A_sel，并用 agent_mask=True 标记 padding。
         agent_query, agent_pos, agent_mask = self.select_and_pad_query(
             agent_query, agent_pos, agent_conf,
             score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
         )
-        agent_pos_emb = self.ego_agent_pos_mlp(agent_pos)
-        # ego <-> agent interaction
+        # 筛选后：agent_query=[B,A_sel,D]，agent_pos=[B,A_sel,2]，mask=[B,A_sel]。
+        agent_pos_emb = self.ego_agent_pos_mlp(agent_pos)  # [B,A_sel,D]
+        # Ego Query 作为 Q，有效 Agent 作为 K/V；输出聚合周围目标及预测运动的场景特征。
         ego_agent_query = self.ego_agent_decoder(
-            query=ego_query.permute(1, 0, 2),
-            key=agent_query.permute(1, 0, 2),
-            value=agent_query.permute(1, 0, 2),
-            query_pos=ego_pos_emb.permute(1, 0, 2),
-            key_pos=agent_pos_emb.permute(1, 0, 2),
-            key_padding_mask=agent_mask)
+            query=ego_query.permute(1, 0, 2),          # [1,B,D]
+            key=agent_query.permute(1, 0, 2),          # [A_sel,B,D]
+            value=agent_query.permute(1, 0, 2),        # [A_sel,B,D]
+            query_pos=ego_pos_emb.permute(1, 0, 2),    # [1,B,D]
+            key_pos=agent_pos_emb.permute(1, 0, 2),    # [A_sel,B,D]
+            key_padding_mask=agent_mask)               # [B,A_sel]
+        # ego_agent_query=[1,B,D]：一个已融合动态交通参与者信息的 Ego Query。
 
-        # ego <-> map interaction
+        #*==================== 7.3 Ego-Map：继续融合静态道路结构 ====================#
+        # 重新建立 Ego 原点位置编码，供地图交叉注意力使用独立的位置映射层。
         ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
-        ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
-        map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
-        map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
-        map_conf = map_outputs_classes[-1]
-        map_pos = map_outputs_coords_bev[-1]
-        # use the most close pts pos in each map inst as the inst's pos
-        batch, num_map = map_pos.shape[:2]
-        map_dis = torch.sqrt(map_pos[..., 0]**2 + map_pos[..., 1]**2)
-        min_map_pos_idx = map_dis.argmin(dim=-1).flatten()  # [B*P]
-        min_map_pos = map_pos.flatten(0, 1)  # [B*P, pts, 2]
-        min_map_pos = min_map_pos[range(min_map_pos.shape[0]), min_map_pos_idx]  # [B*P, 2]
-        min_map_pos = min_map_pos.view(batch, num_map, 2)  # [B, P, 2]
+        ego_pos_emb = self.ego_map_pos_mlp(ego_pos)  # [B,1,D]
+        # 最后一层 Map Decoder 含 V*P 个点特征；恢复实例/点维后，LaneNet 将每条
+        # 折线的 P 个点聚合为一个实例级地图 Query。
+        map_query = map_hs[-1].view(
+            batch_size, self.map_num_vec,
+            self.map_num_pts_per_vec, -1)  # [B,V,P,D]
+        map_query = self.lane_encoder(map_query)  # [B,V,D]
+        map_conf = map_outputs_classes[-1]  # [B,V,Cm]，地图实例分类 logits
+        map_pos = map_outputs_coords_bev[-1]  # [B,V,P,2]，预测地图折线点
+        # 一条折线包含 P 个位置，选择其中距坐标原点最近的点作为该地图实例的位置代表，
+        # 从而把实例位置由 [P,2] 压缩为单个 [2]，用于 Ego-Map 位置编码。
+        batch, num_map = map_pos.shape[:2]  # B, V
+        map_dis = torch.sqrt(map_pos[..., 0]**2 + map_pos[..., 1]**2)  # [B,V,P]
+        min_map_pos_idx = map_dis.argmin(dim=-1).flatten()  # [B*V]
+        min_map_pos = map_pos.flatten(0, 1)  # [B*V,P,2]
+        min_map_pos = min_map_pos[
+            range(min_map_pos.shape[0]), min_map_pos_idx]  # [B*V,2]
+        min_map_pos = min_map_pos.view(batch, num_map, 2)  # [B,V,2]
+        # 按 query_thresh 筛选高置信度地图实例，并补齐为统一的 V_sel 长度。
         map_query, map_pos, map_mask = self.select_and_pad_query(
             map_query, min_map_pos, map_conf,
             score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
         )
-        map_pos_emb = self.ego_map_pos_mlp(map_pos)
+        # 筛选后：map_query=[B,V_sel,D]，map_pos=[B,V_sel,2]，mask=[B,V_sel]。
+        map_pos_emb = self.ego_map_pos_mlp(map_pos)  # [B,V_sel,D]
+        # 使用已经融合 Agent 的 ego_agent_query 作为 Q，让规划表示继续读取地图 K/V；
+        # 因而 ego_map_query 同时包含动态交通参与者和静态道路结构信息。
         ego_map_query = self.ego_map_decoder(
-            query=ego_agent_query,
-            key=map_query.permute(1, 0, 2),
-            value=map_query.permute(1, 0, 2),
-            query_pos=ego_pos_emb.permute(1, 0, 2),
-            key_pos=map_pos_emb.permute(1, 0, 2),
-            key_padding_mask=map_mask)
+            query=ego_agent_query,                       # [1,B,D]
+            key=map_query.permute(1, 0, 2),              # [V_sel,B,D]
+            value=map_query.permute(1, 0, 2),            # [V_sel,B,D]
+            query_pos=ego_pos_emb.permute(1, 0, 2),      # [1,B,D]
+            key_pos=map_pos_emb.permute(1, 0, 2),        # [V_sel,B,D]
+            key_padding_mask=map_mask)                   # [B,V_sel]
+        # ego_map_query=[1,B,D]：完成 Ego-Agent -> Ego-Map 串行交互的规划场景特征。
 
+        #*==================== 7.4 组合 Planning Head 的最终输入 ====================#
+        #* 注意：下面四个 if/elif 属于 7.4，并不是根据驾驶指令选择轨迹；它们只是根据
+        #* 两个配置开关，决定送入 7.5 Planning Head 的 ego_feats 由哪些特征拼接而成。
+        #*
+        #* 开关 1：self.ego_his_encoder is not None
+        #*   “历史”是 ego_his_trajs=[B,1,T_his,2]：自车过去 T_his 个时间间隔的
+        #*   二维逐步位移 (delta_x,delta_y)，描述自车此前的行驶方向、速度变化趋势。
+        #*   True ：用 ego_his_encoder 将整段历史序列编码为 ego_his_feats=[B,1,D]，
+        #*          作为 Planning Head 的显式自车运动历史输入；
+        #*   False：不把 ego_his_trajs 单独送入规划头，改用已融合动态目标信息的
+        #*          ego_agent_query=[B,1,D] 作为最终拼接特征的第一部分。
+        #*   注意：False 只表示“没有显式历史轨迹编码器”，不等于模型完全没有历史；
+        #*   上游 BEV 在启用 prev_bev/video_test_mode 时仍含有历史视觉时序信息。
+        #* 开关 2：self.ego_lcf_feat_idx is not None
+        #*   “状态”是 ego_lcf_feat=[B,1,1,9]：当前帧自车的 9 个低维标量，顺序为
+        #*   [vx, vy, ax, ay, yaw_rate, length, width, speed, curvature]，即
+        #*   x/y速度、x/y加速度、横摆角速度、车长、车宽、纵向速度和转向曲率。
+        #*   True ：ego_lcf_feat_idx 给出要使用的字段下标，例如 [0,1,2,3] 表示
+        #*          只显式输入 vx、vy、ax、ay；选出的 F 个值拼接到 ego_feats；
+        #*   False：不向 Planning Head 额外输入上述自车状态标量。
+        #*   历史是“过去多个时刻的位移序列”，状态是“当前时刻的运动学/尺寸标量”，
+        #*   两者信息形式不同，可以独立启用，也可以同时启用。
+        #*
+        #* 四种组合：
+        #*   ① 有历史 + 有状态 -> [ego_his,   ego_map, ego_lcf]，shape=[B,1,2D+F]
+        #*   ② 有历史 + 无状态 -> [ego_his,   ego_map]，          shape=[B,1,2D]
+        #*   ③ 无历史 + 有状态 -> [ego_agent, ego_map, ego_lcf]，shape=[B,1,2D+F]
+        #*   ④ 无历史 + 无状态 -> [ego_agent, ego_map]，          shape=[B,1,2D]
+        #*
+        #* ego_map_query 虽名为 map query，但它以 ego_agent_query 为输入经过 Ego-Map
+        #* Decoder 得到，因此已包含前一阶段的 Agent 信息和本阶段的 Map 信息。
+        # ego_lcf_feat 可包含速度、加速度、转向等量；这里只取 ego_lcf_feat_idx 指定的
+        # F=len(ego_lcf_feat_idx) 个维度。四个分支运行时只会命中其中一个。
         if self.ego_his_encoder is not None and self.ego_lcf_feat_idx is not None:
+            # 情况①：显式自车历史 D + Agent/Map 场景特征 D + 自车低维状态 F。
             ego_feats = torch.cat(
                 [ego_his_feats,
                  ego_map_query.permute(1, 0, 2),
+                 # ego_lcf_feat 原布局保留单 Ego 维；squeeze(1) 后按索引选取 F 个状态量。
                  ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
                 dim=-1
-            )  # [B, 1, 2D+2]
+            )  # [B,1,2D+F]
         elif self.ego_his_encoder is not None and self.ego_lcf_feat_idx is None:
+            # 情况②：显式自车历史 D + Agent/Map 场景特征 D，不追加低维状态。
             ego_feats = torch.cat(
                 [ego_his_feats,
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
-            )  # [B, 1, 2D]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:                
+            )  # [B,1,2D]
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:
+            # 情况③：不使用历史编码，显式拼接 Agent 交互 D、Agent/Map 交互 D 和状态 F。
             ego_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2),
                  ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
                 dim=-1
-            )  # [B, 1, 2D+2]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:                
+            )  # [B,1,2D+F]
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:
+            # 情况④：不使用历史编码和低维状态，只拼接两个场景交互特征。
+            # 当前 VAD_tiny_stage_2_custom.py 中两个配置均为 None，因此实际走此分支。
             ego_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
-            )  # [B, 1, 2D]  
+            )  # [B,1,2D]
 
-        # Ego prediction
-        outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0], 
-                                                      self.ego_fut_mode, self.fut_ts, 2)
+        #*==================== 7.5 Planning Head 输出各驾驶指令槽位的自车轨迹 ====================#
+        # MLP 一次输出 Me=ego_fut_mode 条自车候选规划，每条包含 T 个二维未来轨迹点。
+        #* 上述四个 if/elif 与左转/直行/右转无关。这里也没有把 ego_fut_cmd 拼入
+        #* ego_feats；而是固定输出 Me 个槽位，让各槽位分别学习一个高层驾驶指令。
+        # 训练时 ego_fut_cmd=[B,Me] 是 one-hot mask：只给当前指令对应槽位计算有效损失；
+        # 推理/评估时取 nonzero(ego_fut_cmd) 得到指令索引，再选择该槽位的规划轨迹。
+        outputs_ego_trajs = self.ego_fut_decoder(
+            ego_feats)  # [B,1,Me*T*2]
+        # 去掉单个 Ego Query 维并恢复“指令模态-时间-二维坐标”结构。
+        outputs_ego_trajs = outputs_ego_trajs.reshape(
+            outputs_ego_trajs.shape[0],
+            self.ego_fut_mode, self.fut_ts, 2)  # [B,Me,T,2]
 
+        #*==================== 8. 汇总感知、预测与规划输出 ====================#
+        # Ld/Lm：agent/map decoder 层数；B：batch size；
+        # A：agent 数；V/P：地图实例数/每个实例的点数；M/Me：agent/ego 轨迹模态数；
+        # T：未来时间步数；D：特征维度；Ca/Cm：agent/map 类别数。
         outs = {
-            'bev_embed': bev_embed,
-            'all_cls_scores': outputs_classes,
-            'all_bbox_preds': outputs_coords,
-            'all_traj_preds': outputs_trajs.repeat(outputs_coords.shape[0], 1, 1, 1, 1),
-            'all_traj_cls_scores': outputs_trajs_classes.repeat(outputs_coords.shape[0], 1, 1, 1),
-            'map_all_cls_scores': map_outputs_classes,
-            'map_all_bbox_preds': map_outputs_coords,
-            'map_all_pts_preds': map_outputs_pts_coords,
-            'enc_cls_scores': None,
-            'enc_bbox_preds': None,
-            'map_enc_cls_scores': None,
-            'map_enc_bbox_preds': None,
-            'map_enc_pts_preds': None,
-            'ego_fut_preds': outputs_ego_trajs,
+            'bev_embed': bev_embed,  # 时空融合后的 BEV 特征，[bev_h*bev_w, B, D]
+            'all_cls_scores': outputs_classes,  # 各层 agent 类别 logits，[Ld, B, A, Ca]
+            'all_bbox_preds': outputs_coords,  # 各层 agent 3D 框编码，[Ld, B, A, code_size]，默认 code_size=10
+            'all_traj_preds': outputs_trajs.repeat(  # agent 多模态未来二维位移，[Ld, B, A, M, T*2]
+                outputs_coords.shape[0], 1, 1, 1, 1),  # 运动分支仅预测一次，此处复制 Ld 份以计算逐层 loss
+            'all_traj_cls_scores': outputs_trajs_classes.repeat(  # agent 轨迹模态 logits，[Ld, B, A, M]
+                outputs_coords.shape[0], 1, 1, 1),  # 同样复制 Ld 份以适配各检测 decoder 层
+            'map_all_cls_scores': map_outputs_classes,  # 各层地图实例类别 logits，[Lm, B, V, Cm]
+            'map_all_bbox_preds': map_outputs_coords,  # 各层地图实例包围框 (cx,cy,w,h)，[Lm, B, V, 4]
+            'map_all_pts_preds': map_outputs_pts_coords,  # 各层地图实例有序矢量点，[Lm, B, V, P, 2]
+            'enc_cls_scores': None,  # agent encoder proposal 类别预测；当前实现未返回
+            'enc_bbox_preds': None,  # agent encoder proposal 框预测；当前实现未返回
+            'map_enc_cls_scores': None,  # map encoder proposal 类别预测；当前实现未返回
+            'map_enc_bbox_preds': None,  # map encoder proposal 包围框预测；当前实现未返回
+            'map_enc_pts_preds': None,  # map encoder proposal 矢量点预测；当前实现未返回
+            'ego_fut_preds': outputs_ego_trajs,  # 不同驾驶指令下的自车未来二维位移，[B, Me, T, 2]
         }
 
         return outs
@@ -959,39 +1213,57 @@ class VADHead(DETRHead):
                 - pos_inds (Tensor): Sampled positive indices for each image.
                 - neg_inds (Tensor): Sampled negative indices for each image.
         """
-        num_bboxes = bbox_pred.size(0)
-        # assigner and sampler
+        #*==================== 单帧地图匹配并构造监督 Target ====================#
+        #* 本函数不直接计算 loss：它先调用 assigner 完成实例匹配与最佳点序搜索，
+        #* 再把匹配结果展开成与全部 V 个地图 query 对齐的分类、框和点坐标 target。
+        # V=num_query，G=当前帧 GT 数，S=每个 GT 的候选点序数，P=每条折线点数。
+        num_bboxes = bbox_pred.size(0)  # V
         gt_c = gt_bboxes.shape[-1]
-        assign_result, order_index = self.map_assigner.assign(bbox_pred, cls_score, pts_pred,
-                                             gt_bboxes, gt_labels, gt_shifts_pts,
-                                             gt_bboxes_ignore)
+        # assign_result：V 个 query 的匹配 GT 编号；order_index=[V,G]，保存每一对
+        # 预测-GT 在 S 个等价点序中的最佳候选编号。真正的 Hungarian 在 assign() 内完成。
+        assign_result, order_index = self.map_assigner.assign(
+            bbox_pred, cls_score, pts_pred,
+            gt_bboxes, gt_labels, gt_shifts_pts, gt_bboxes_ignore)
 
-        sampling_result = self.map_sampler.sample(assign_result, bbox_pred,
-                                              gt_bboxes)
-        pos_inds = sampling_result.pos_inds
-        neg_inds = sampling_result.neg_inds
-        # label targets
+        # PseudoSampler 不再随机采样，只根据 assign_result 分离匹配成功和未匹配的 query。
+        sampling_result = self.map_sampler.sample(
+            assign_result, bbox_pred, gt_bboxes)
+        pos_inds = sampling_result.pos_inds  # 匹配成功的预测 query 编号
+        neg_inds = sampling_result.neg_inds  # 未匹配、作为背景监督的预测 query 编号
+
+        #* 分类 target：默认类别设为 map_num_classes（背景类），正样本再写入 GT 类别。
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.map_num_classes,
                                     dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
-        # bbox targets
+
+        #* 框 target：仅正样本位置写入匹配 GT 框并赋权 1，背景 query 的回归权重保持 0。
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
-        # pts targets
+
+        #* 点 target：对每个 Hungarian 正样本匹配对 (pred_i,gt_j)，查询
+        #* order_index[i,j]，获得该 GT 针对当前预测的最佳等价点序编号 assigned_shift。
         if order_index is None:
+            # 空 GT/空预测时 assigner 返回 None；此时 pos_inds 也为空，不会产生点回归监督。
             assigned_shift = gt_labels[sampling_result.pos_assigned_gt_inds]
         else:
-            assigned_shift = order_index[sampling_result.pos_inds, sampling_result.pos_assigned_gt_inds]
+            assigned_shift = order_index[
+                sampling_result.pos_inds,
+                sampling_result.pos_assigned_gt_inds]  # [num_pos]
+        # 为全部 V 个 query 建立占位 target；只有正样本位置会被填写并赋权。
         pts_targets = pts_pred.new_zeros((pts_pred.size(0),
-                        pts_pred.size(1), pts_pred.size(2)))
+                                          pts_pred.size(1),
+                                          pts_pred.size(2)))  # [V,P,2]
         pts_weights = torch.zeros_like(pts_targets)
         pts_weights[pos_inds] = 1.0
-        # DETR
+        # 将每个正样本对应的 GT 框写入其 query 位置。
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
-        pts_targets[pos_inds] = gt_shifts_pts[sampling_result.pos_assigned_gt_inds,assigned_shift,:,:]
+        # gt_shifts_pts=[G,S,P,2]，同时按 GT 编号与最佳候选编号索引，得到 [num_pos,P,2]。
+        pts_targets[pos_inds] = gt_shifts_pts[
+            sampling_result.pos_assigned_gt_inds, assigned_shift, :, :]
+        # 后续 map_loss_single() 使用这些 target/weight 计算分类、框、点和方向损失。
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pts_targets, pts_weights,
                 pos_inds, neg_inds)
@@ -1087,6 +1359,9 @@ class VADHead(DETRHead):
                 - num_total_neg (int): Number of negative samples in all \
                     images.
         """
+        #*==================== Batch 级地图 Target 构造入口 ====================#
+        # 当前函数把一个 batch 拆成逐帧输入，并行调用 _map_get_target_single()；
+        # 每个 decoder layer 调用一次本函数，因此各层都独立参与辅助监督。
         assert gt_bboxes_ignore_list is None, \
             'Only supports for gt_bboxes_ignore setting to None.'
         num_imgs = len(cls_scores_list)
@@ -1094,11 +1369,15 @@ class VADHead(DETRHead):
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
 
+        # multi_apply 等价于对 batch 中每一帧分别执行单帧匹配和 target 构造。
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pts_targets_list, pts_weights_list,
          pos_inds_list, neg_inds_list) = multi_apply(
-            self._map_get_target_single, cls_scores_list, bbox_preds_list,pts_preds_list,
-            gt_labels_list, gt_bboxes_list, gt_shifts_pts_list, gt_bboxes_ignore_list)
+            self._map_get_target_single,
+            cls_scores_list, bbox_preds_list, pts_preds_list,
+            gt_labels_list, gt_bboxes_list, gt_shifts_pts_list,
+            gt_bboxes_ignore_list)
+        # 汇总 batch 内正/负 query 数，供后续各项 loss 做归一化。
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
@@ -1173,7 +1452,7 @@ class VADHead(DETRHead):
             loss_plan_bound = torch.nan_to_num(loss_plan_bound)
             loss_plan_col = torch.nan_to_num(loss_plan_col)
             loss_plan_dir = torch.nan_to_num(loss_plan_dir)
-        
+
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
         loss_plan_dict['loss_plan_bound'] = loss_plan_bound
@@ -1181,7 +1460,7 @@ class VADHead(DETRHead):
         loss_plan_dict['loss_plan_dir'] = loss_plan_dir
 
         return loss_plan_dict
-    
+
     def loss_single(self,
                     cls_scores,
                     bbox_preds,
@@ -1400,7 +1679,7 @@ class VADHead(DETRHead):
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          pts_targets_list, pts_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
- 
+
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -1439,42 +1718,66 @@ class VADHead(DETRHead):
             bbox_weights[isnotnan, :4],
             avg_factor=num_total_pos)
 
-        # regression pts CD loss
-        # num_samples, num_order, num_pts, num_coords
-        normalized_pts_targets = normalize_2d_pts(pts_targets, self.pc_range)
+        #*==================== 地图有序点坐标与方向监督 ====================#
+        #* 匹配阶段已经为每个正样本预测选定一个 GT 实例及其代价最小的等价点序；
+        #* 因而这里不再遍历正序、反序或闭环移位候选，而是直接监督选中的点序。
+        # pts_targets=[Q,P_gt,2]：Q=B*V 为展平后的全部地图 query 数；
+        # P_gt=map_num_pts_per_gt_vec 为每个 GT 实例的采样点数；2=(x,y)。
+        # 将 GT 米制坐标归一化到 [0,1]，使其与 sigmoid 输出的预测点处于同一坐标尺度。
+        normalized_pts_targets = normalize_2d_pts(pts_targets, self.pc_range)  # [Q,P_gt,2]
 
-        # num_samples, num_pts, num_coords
-        pts_preds = pts_preds.reshape(-1, pts_preds.size(-2), pts_preds.size(-1))
+        # pts_preds 原形状通常为 [B,V,P_pred,2]；合并 B、V，得到 [Q,P_pred,2]。
+        # Q 中既含 Hungarian 匹配到 GT 的正样本，也含未匹配的背景 query；后者权重为 0。
+        pts_preds = pts_preds.reshape(-1, pts_preds.size(-2), pts_preds.size(-1))  # [Q,P_pred,2]
+        # 若预测折线点数 P_pred 与 GT 采样点数 P_gt 不同，先沿折线点序维插值对齐。
         if self.map_num_pts_per_vec != self.map_num_pts_per_gt_vec:
-            pts_preds = pts_preds.permute(0,2,1)
-            pts_preds = F.interpolate(pts_preds, size=(self.map_num_pts_per_gt_vec), mode='linear',
-                                    align_corners=True)
-            pts_preds = pts_preds.permute(0,2,1).contiguous()
+            # F.interpolate 对一维序列要求 [N,C,L]，故变为 [Q,2,P_pred]：C=坐标通道，L=点序。
+            pts_preds = pts_preds.permute(0, 2, 1)  # [Q,2,P_pred]
+            # 在线序列上做线性插值，将每条预测折线重采样为 P_gt 个有序点。
+            pts_preds = F.interpolate(
+                pts_preds, size=self.map_num_pts_per_gt_vec,
+                mode='linear', align_corners=True)  # [Q,2,P_gt]
+            # 恢复点集布局；contiguous() 使转置后的张量在内存中连续，便于后续损失计算。
+            pts_preds = pts_preds.permute(0, 2, 1).contiguous()  # [Q,P_gt,2]
 
+        #* PtsL1Loss：逐点比较预测 (x,y) 与最佳 GT 点序中对应点的归一化坐标。
+        # isnotnan=[Q] 来自 bbox GT 的有限值检查，用于滤除无效实例；pts_weights=[Q,P_gt,2]
+        # 对正样本的有效坐标赋权，对背景 query 和 padding/无效位置赋 0 权重。
         loss_pts = self.loss_map_pts(
-            pts_preds[isnotnan,:,:],
-            normalized_pts_targets[isnotnan,:,:], 
-            pts_weights[isnotnan,:,:],
-            avg_factor=num_total_pos)
+            pts_preds[isnotnan, :, :],                    # 有效预测点：[Q_valid,P_gt,2]
+            normalized_pts_targets[isnotnan, :, :],      # 有效 GT 点：[Q_valid,P_gt,2]
+            pts_weights[isnotnan, :, :],                 # 逐点、逐坐标权重：[Q_valid,P_gt,2]
+            avg_factor=num_total_pos)                    # 按跨 GPU 汇总后的正样本实例数归一化
 
-        dir_weights = pts_weights[:, :-self.map_dir_interval,0]
-        denormed_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range)
-        denormed_pts_preds_dir = denormed_pts_preds[:,self.map_dir_interval:,:] - \
-            denormed_pts_preds[:,:-self.map_dir_interval,:]
-        pts_targets_dir = pts_targets[:, self.map_dir_interval:,:] - pts_targets[:,:-self.map_dir_interval,:]
+        #* PtsDirCosLoss：方向不是额外预测量，而是从相隔 k 个位置的有序点作有向差分：
+        #* d_i=p_(i+k)-p_i，其中 k=map_dir_interval，共得到 P_gt-k 个局部方向向量。
+        # 向量带符号，所以 0° 时 cos=1、180° 时 cos=-1；反向点序不会被当作同一方向。
+        # 每个方向沿用其起点 p_i 的 x 坐标权重；x、y 对一个方向共用同一有效性权重。
+        dir_weights = pts_weights[:, :-self.map_dir_interval, 0]  # [Q,P_gt-k]
+        # 将预测点还原到以米为单位的 BEV 坐标，避免 x/y 归一化尺度不同扭曲方向夹角。
+        denormed_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range)  # [Q,P_gt,2]
+        # 预测局部方向：后方第 k 个点减当前点，输出 [Q,P_gt-k,2]。
+        denormed_pts_preds_dir = \
+            denormed_pts_preds[:, self.map_dir_interval:, :] - \
+            denormed_pts_preds[:, :-self.map_dir_interval, :]
+        # GT 已经是米制坐标，使用相同的有向差分定义构造监督方向。
+        pts_targets_dir = \
+            pts_targets[:, self.map_dir_interval:, :] - \
+            pts_targets[:, :-self.map_dir_interval, :]  # [Q,P_gt-k,2]
 
+        # 余弦方向损失只比较方向夹角，基本不受向量长度影响；有效正样本参与归一化。
         loss_dir = self.loss_map_dir(
-            denormed_pts_preds_dir[isnotnan,:,:],
-            pts_targets_dir[isnotnan,:,:],
-            dir_weights[isnotnan,:],
-            avg_factor=num_total_pos)
+            denormed_pts_preds_dir[isnotnan, :, :],  # 有效预测方向：[Q_valid,P_gt-k,2]
+            pts_targets_dir[isnotnan, :, :],         # 有效 GT 方向：[Q_valid,P_gt-k,2]
+            dir_weights[isnotnan, :],                # 各局部方向权重：[Q_valid,P_gt-k]
+            avg_factor=num_total_pos)                # 按正样本地图实例数归一化
 
         bboxes = denormalize_2d_bbox(bbox_preds, self.pc_range)
         # regression IoU loss, defaultly GIoU loss
         loss_iou = self.loss_map_iou(
             bboxes[isnotnan, :4],
             bbox_targets[isnotnan, :4],
-            bbox_weights[isnotnan, :4], 
+            bbox_weights[isnotnan, :4],
             avg_factor=num_total_pos)
 
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
@@ -1565,7 +1868,7 @@ class VADHead(DETRHead):
             self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
             all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
             all_gt_attr_labels_list, all_gt_bboxes_ignore_list)
-        
+
 
         num_dec_layers = len(map_all_cls_scores)
         device = map_gt_labels_list[0].device
@@ -1758,7 +2061,7 @@ class VADHead(DETRHead):
             selected_map_pos: [B*A, P1(+1), 2]
             selected_padding_mask: [B*A, P1(+1)]
         """
-        
+
         if dis_thresh is None:
             raise NotImplementedError('Not implement yet')
 

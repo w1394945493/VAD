@@ -248,6 +248,8 @@ def main():
     outputs = tmp
     rank, _ = get_dist_info()
     if rank == 0:
+        # *=================================================================#
+        # * 保存逐样本完整预测结果，包括检测、地图、轨迹规划和评估结果等输出。
         if args.out:
             print(f'\nwriting results to {args.out}')
             # assert False
@@ -255,6 +257,8 @@ def main():
                 mmcv.dump(outputs, args.out)
             else:
                 mmcv.dump(outputs['bbox_results'], args.out)
+        # *===========================================================#
+        # * 默认路径：test/<配置文件名>/<运行时间>/results_nusc.pkl
         kwargs = {} if args.eval_options is None else args.eval_options
         kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
             '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
@@ -264,27 +268,24 @@ def main():
         if args.eval:
             eval_kwargs = cfg.get('evaluation', {}).copy()
             # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
+            for key in ['interval', 'tmpdir', 'start', 'gpu_collect', 'save_best', 'rule']:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
 
             print(dataset.evaluate(outputs['bbox_results'], **eval_kwargs))
-    
+
         # # # NOTE: record to json
         # json_path = args.json_dir
         # if not os.path.exists(json_path):
         #     os.makedirs(json_path)
-        
+
         # metric_all = []
         # for res in outputs['bbox_results']:
         #     for k in res['metric_results'].keys():
         #         if type(res['metric_results'][k]) is np.ndarray:
         #             res['metric_results'][k] = res['metric_results'][k].tolist()
         #     metric_all.append(res['metric_results'])
-        
+
         # print('start saving to json done')
         # with open(json_path+'/metric_record.json', "w", encoding="utf-8") as f2:
         #     json.dump(metric_all, f2, indent=4)

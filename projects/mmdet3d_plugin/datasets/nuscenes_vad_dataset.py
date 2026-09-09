@@ -54,6 +54,7 @@ class LiDARInstanceLines(object):
         self.fixed_num = fixed_num
         self.padding_value = padding_value
 
+        #* instance_list 中每个 LineString 都是一个独立地图实例；列表长度 N 即 GT 实例数。
         self.instance_list = instance_line_list
 
     @property
@@ -100,23 +101,36 @@ class LiDARInstanceLines(object):
 
     @property
     def fixed_num_sampled_points(self):
+        """将每条地图折线等弧长重采样为固定数量的二维点。
+
+        Returns:
+            Tensor: shape=[N, P, 2]，最后一维是局部 LiDAR 坐标 (x, y)。
+                N 为当前帧的真实地图实例数，P 为 ``self.fixed_num``。
         """
-        return torch.Tensor([N,fixed_num,2]), in xmin, ymin, xmax, ymax form
-            N means the num of instances
-        """
-        assert len(self.instance_list) != 0
-        instance_points_list = []
-        for instance in self.instance_list:
-            distances = np.linspace(0, instance.length, self.fixed_num)
-            sampled_points = np.array([list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
-            instance_points_list.append(sampled_points)
-        instance_points_array = np.array(instance_points_list)
-        instance_points_tensor = to_tensor(instance_points_array)
-        instance_points_tensor = instance_points_tensor.to(
-                            dtype=torch.float32)
-        instance_points_tensor[:,:,0] = torch.clamp(instance_points_tensor[:,:,0], min=-self.max_x,max=self.max_x)
-        instance_points_tensor[:,:,1] = torch.clamp(instance_points_tensor[:,:,1], min=-self.max_y,max=self.max_y)
-        return instance_points_tensor
+        #* 将不同长度的 N 条地图实例统一采样成 [N,P,2]，与模型的 V×P Map Query 对齐：
+        # N 是当前帧真实地图实例数，P=fixed_num 是每个实例的固定有序点数。
+        assert len(self.instance_list) != 0  # 必须至少包含一条有效 LineString
+        instance_points_list = []  # 暂存每个实例采样后的 ndarray[P,2]
+        for instance in self.instance_list:  # instance 是自车局部坐标系中的一条连续 LineString
+            # 从弧长 0 到总弧长均匀生成 P 个采样位置，包含折线的首尾端点。
+            distances = np.linspace(0, instance.length, self.fixed_num)  # [P]
+            # interpolate(d) 返回沿折线前进弧长 d 后的点，而不是对 x/y 坐标直接线性插值。
+            sampled_points = np.array([
+                list(instance.interpolate(distance).coords)
+                for distance in distances
+            ]).reshape(-1, 2)  # [P,1,2] -> [P,2]，按线方向保持有序
+            instance_points_list.append(sampled_points)  # 收集第 n 个地图实例的 P 个点
+        #* 将 N 个实例堆叠为统一数组：[P,2] × N -> [N,P,2]。
+        instance_points_array = np.array(instance_points_list)  # numpy，[N,P,2]
+        instance_points_tensor = to_tensor(instance_points_array)  # numpy -> torch.Tensor
+        instance_points_tensor = instance_points_tensor.to(dtype=torch.float32)  # 统一为模型计算精度
+        # 将 x 坐标限制在局部 patch 范围 [-max_x,max_x]，避免数值越过裁剪边界。
+        instance_points_tensor[:, :, 0] = torch.clamp(
+            instance_points_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+        # 将 y 坐标限制在局部 patch 范围 [-max_y,max_y]。
+        instance_points_tensor[:, :, 1] = torch.clamp(
+            instance_points_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+        return instance_points_tensor  # float32，[N,P,2]
 
     @property
     def fixed_num_sampled_points_ambiguity(self):
@@ -164,11 +178,37 @@ class LiDARInstanceLines(object):
         instance_points_tensor[:,:,1] = torch.clamp(instance_points_tensor[:,:,1], min=-self.max_y,max=self.max_y)
         return instance_points_tensor
 
+    #*==================== GT 地图实例的等价候选点序 ====================#
+    #* 为什么需要候选：地图实例是一条由 P 个有序点表示的折线，但同一几何形状可能有
+    #* 多种等价序列。若只保留一种序列，几何完全正确的预测也可能因起点或方向不同而
+    #* 得到很大的逐点 L1 代价。
+    #
+    # 开放线没有首尾连接，只有两种等价表示：
+    #   正序 [p0,p1,...,p(P-1)] 与反序 [p(P-1),...,p1,p0]。
+    # 对开放线做循环移位不是等价表示，因为会额外引入“末点 -> 首点”的错误连接。
+    #
+    # 闭合线的末点重复首点，例如三角形 [p0,p1,p2,p0]。它没有唯一自然起点，因此
+    # 可循环改变起点：[p1,p2,p0,p1]、[p2,p0,p1,p2]；某些版本还同时考虑反方向。
+    #
+    # 候选不是多个不同的地图真值，也不是多模态地图预测，而是同一个 GT 几何实例的
+    # 多种等价编码。训练时，一个预测与一个 GT 的所有候选比较，取最小点序代价构造
+    # Pred-GT 代价矩阵；Hungarian 再做实例级一对一匹配。最终 loss 只使用匹配 GT 的
+    # 最佳候选点序，不会对该 GT 的所有候选同时计算监督损失。
+    # 候选在此处生成；实际候选选择和匹配位于 VAD_head.py 的 map_get_target_single()
+    # 以及 core/bbox/assigners/map_hungarian_assigner_3d.py。
+    #
+    # 不同实例的有效候选数不同，为便于堆叠成 [N,S,P,2]，不足的候选槽位使用
+    # padding_value 填充：N=GT实例数，S=候选点序槽位数，P=每种点序的固定点数，
+    # 2=(x,y)。下列 v0-v4 是起点、方向和“先采样还是先移位”的不同生成策略。
+
     @property
     def shift_fixed_num_sampled_points(self):
+        """v0：直接对固定采样点做点序变换。
+
+        开放线生成正序和反序；闭合线对包含重复终点的 P 个采样点做 P 次循环移位。
+        Returns: [N, P, P, 2]，不足的开放线候选使用 padding_value 补齐。
         """
-        return  [instances_num, num_shifts, fixed_num, 2]
-        """
+        #* 同一条无方向矢量线可从两端描述；为 GT 构造不同点序，供匹配时消除方向歧义。
         fixed_num_sampled_points = self.fixed_num_sampled_points
         instances_list = []
         is_poly = False
@@ -204,8 +244,10 @@ class LiDARInstanceLines(object):
 
     @property
     def shift_fixed_num_sampled_points_v1(self):
-        """
-        return  [instances_num, num_shifts, fixed_num, 2]
+        """v1：在固定采样点上生成不重复闭合起点的等价点序。
+
+        闭合线先去掉重复终点，对 P-1 个点循环移位后重新闭合；开放线生成正反序。
+        Returns: [N, P-1, P, 2]，不足的候选使用 padding_value 补齐。
         """
         fixed_num_sampled_points = self.fixed_num_sampled_points
         instances_list = []
@@ -251,66 +293,96 @@ class LiDARInstanceLines(object):
 
     @property
     def shift_fixed_num_sampled_points_v2(self):
-        """
-        return  [instances_num, num_shifts, fixed_num, 2]
-        """
-        assert len(self.instance_list) != 0
-        instances_list = []
-        for instance in self.instance_list:
-            distances = np.linspace(0, instance.length, self.fixed_num)
-            poly_pts = np.array(list(instance.coords))
-            start_pts = poly_pts[0]
-            end_pts = poly_pts[-1]
-            is_poly = np.equal(start_pts, end_pts)
-            is_poly = is_poly.all()
-            shift_pts_list = []
-            pts_num, coords_num = poly_pts.shape
-            shift_num = pts_num - 1
-            final_shift_num = self.fixed_num - 1
-            if is_poly:
-                pts_to_shift = poly_pts[:-1,:]
-                for shift_right_i in range(shift_num):
-                    shift_pts = np.roll(pts_to_shift,shift_right_i,axis=0)
-                    pts_to_concat = shift_pts[0]
-                    pts_to_concat = np.expand_dims(pts_to_concat,axis=0)
-                    shift_pts = np.concatenate((shift_pts,pts_to_concat),axis=0)
-                    shift_instance = LineString(shift_pts)
-                    shift_sampled_points = np.array([list(shift_instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
-                    shift_pts_list.append(shift_sampled_points)
-                # import pdb;pdb.set_trace()
-            else:
-                sampled_points = np.array([list(instance.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
-                flip_sampled_points = np.flip(sampled_points, axis=0)
-                shift_pts_list.append(sampled_points)
-                shift_pts_list.append(flip_sampled_points)
-            
-            multi_shifts_pts = np.stack(shift_pts_list,axis=0)
-            shifts_num,_,_ = multi_shifts_pts.shape
+        """v2：在原始 LineString 顶点上改变点序，再将每个候选重采样为 P 个点。
 
-            if shifts_num > final_shift_num:
-                index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
-                multi_shifts_pts = multi_shifts_pts[index]
-            
-            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
-            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
-                            dtype=torch.float32)
-            
-            multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
-            multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
-            # if not is_poly:
-            if multi_shifts_pts_tensor.shape[0] < final_shift_num:
-                padding = torch.full([final_shift_num-multi_shifts_pts_tensor.shape[0],self.fixed_num,2], self.padding_value)
-                multi_shifts_pts_tensor = torch.cat([multi_shifts_pts_tensor,padding],dim=0)
+        开放线生成正序和反序；闭合线仅生成原方向的不同起点，不生成反方向。
+        Returns:
+            Tensor: shape=[N, S, P, 2]，其中：
+                N = 当前帧的 GT 地图实例数，不固定；
+                S = 每个 GT 预留的候选点序数，v2 中固定为 P-1；
+                P = 每个候选点序包含的有序采样点数，即 self.fixed_num；
+                2 = 每个采样点的局部坐标 (x,y)。
+
+            索引 ``tensor[n, s, p, c]`` 表示：第 n 个地图实例的第 s 种
+            等价点序中，第 p 个有序点的第 c 个坐标，c=0/1 对应 x/y。
+            例如 P=20 时 S=19，单个 GT 的 shape 为 [19,20,2]；开放线只有
+            正序/反序两个有效候选，其余 17 个候选槽位由 padding_value 填充。
+        """
+        assert len(self.instance_list) != 0  # 当前帧必须至少有一个有效 LineString 实例
+        #* 记 S=P-1。每个实例最终整理成 [S,P,2]，N 个实例再堆叠为 [N,S,P,2]。
+        instances_list = []  # 长度最终为 N；列表中每项对应一个 GT 地图实例
+        for instance in self.instance_list:  # 逐个处理当前帧的 N 个 GT 地图实例
+            # 在该实例弧长 [0,length] 上生成 P 个等距采样位置，包含首尾位置。
+            distances = np.linspace(0, instance.length, self.fixed_num)  # [P]
+            poly_pts = np.array(list(instance.coords))  # LineString 原始顶点，[K,2]，K 不固定
+            start_pts = poly_pts[0]  # 原始折线起点，[2]
+            end_pts = poly_pts[-1]  # 原始折线终点，[2]
+            is_poly = np.equal(start_pts, end_pts)  # 分别判断起终点的 x/y 是否相等，[2]
+            is_poly = is_poly.all()  # x/y 都相等则为闭合线，否则为开放线
+            shift_pts_list = []  # 当前实例的所有有效等价点序，每项最终为 [P,2]
+            pts_num, coords_num = poly_pts.shape  # K=原始顶点数，coords_num=2
+            shift_num = pts_num - 1  # 闭合线末点重复首点，因此有 K-1 个不同起点
+            final_shift_num = self.fixed_num - 1  # S=P-1：每个 GT 的统一候选点序槽位数
+            if is_poly:  #* 闭合线：起点任意，循环移位仍表示同一个几何轮廓
+                pts_to_shift = poly_pts[:-1, :]  # 去掉与首点重复的末点，[K-1,2]
+                for shift_right_i in range(shift_num):  # 枚举原始轮廓的 K-1 个可能起点
+                    shift_pts = np.roll(pts_to_shift, shift_right_i, axis=0)  # 循环改变起点
+                    pts_to_concat = shift_pts[0]  # 取移位后的新起点，[2]
+                    pts_to_concat = np.expand_dims(pts_to_concat, axis=0)  # [2] -> [1,2]
+                    # 把新起点追加到末尾，重新形成首尾相同的闭合 LineString。
+                    shift_pts = np.concatenate((shift_pts, pts_to_concat), axis=0)  # [K,2]
+                    shift_instance = LineString(shift_pts)  # 当前起点对应的等价闭合折线
+                    # 沿该等价折线按弧长重采样 P 个有序点，统一不同原始顶点数。
+                    shift_sampled_points = np.array([
+                        list(shift_instance.interpolate(distance).coords)
+                        for distance in distances
+                    ]).reshape(-1, 2)  # [P,1,2] -> [P,2]
+                    shift_pts_list.append(shift_sampled_points)  # 保存一个闭合线起点候选
+            else:  #* 开放线：只有从两端出发的正序和反序两种等价表示
+                sampled_points = np.array([
+                    list(instance.interpolate(distance).coords)
+                    for distance in distances
+                ]).reshape(-1, 2)  # 沿原始方向等弧长采样，[P,2]
+                flip_sampled_points = np.flip(sampled_points, axis=0)  # 反转点序，[P,2]
+                shift_pts_list.append(sampled_points)  # 候选 0：起点 -> 终点
+                shift_pts_list.append(flip_sampled_points)  # 候选 1：终点 -> 起点
+
+            multi_shifts_pts = np.stack(shift_pts_list, axis=0)  # [有效候选数,P,2]
+            shifts_num, _, _ = multi_shifts_pts.shape  # 当前实例生成的有效候选点序数
+            if shifts_num > final_shift_num:  # 候选过多时限制为统一的 P-1 个
+                # 无放回随机选择 P-1 个闭合线起点，避免不同实例产生不同 shape。
+                index = np.random.choice(
+                    multi_shifts_pts.shape[0], final_shift_num, replace=False)
+                multi_shifts_pts = multi_shifts_pts[index]  # [S,P,2]
+
+            multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)  # numpy -> Tensor
+            multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(dtype=torch.float32)
+            # 将所有候选的 x/y 限制在局部地图 patch 范围内。
+            multi_shifts_pts_tensor[:, :, 0] = torch.clamp(
+                multi_shifts_pts_tensor[:, :, 0], min=-self.max_x, max=self.max_x)
+            multi_shifts_pts_tensor[:, :, 1] = torch.clamp(
+                multi_shifts_pts_tensor[:, :, 1], min=-self.max_y, max=self.max_y)
+            if multi_shifts_pts_tensor.shape[0] < final_shift_num:  # 有效候选不足 P-1 个
+                #* 用 padding_value 补齐候选维；这些填充值只用于保持 batch 张量 shape 一致。
+                padding = torch.full(
+                    [final_shift_num - multi_shifts_pts_tensor.shape[0], self.fixed_num, 2],
+                    self.padding_value)
+                multi_shifts_pts_tensor = torch.cat(
+                    [multi_shifts_pts_tensor, padding], dim=0)  # [S,P,2]
+            # 当前实例结果：[S,P,2]；S 个候选点序，每种点序含 P 个二维点。
             instances_list.append(multi_shifts_pts_tensor)
-        instances_tensor = torch.stack(instances_list, dim=0)
-        instances_tensor = instances_tensor.to(
-                            dtype=torch.float32)
+        #* 在最前面增加实例维：N 个 [S,P,2] -> [N,S,P,2]。
+        instances_tensor = torch.stack(instances_list, dim=0)  # dim0=n：GT地图实例索引
+        instances_tensor = instances_tensor.to(dtype=torch.float32)
+        # [N,S,P,2]：实例n × 候选点序s × 有序点p × 坐标(x,y)，其中 S=P-1。
         return instances_tensor
 
     @property
     def shift_fixed_num_sampled_points_v3(self):
-        """
-        return  [instances_num, num_shifts, fixed_num, 2]
+        """v3：v2 的双方向闭合线版本。
+
+        在原始顶点上处理；闭合线同时生成正向/反向的循环起点，开放线生成正反序，
+        然后全部重采样为 P 个点。Returns: [N, 2*(P-1), P, 2]。
         """
         assert len(self.instance_list) != 0
         instances_list = []
@@ -378,8 +450,10 @@ class LiDARInstanceLines(object):
 
     @property
     def shift_fixed_num_sampled_points_v4(self):
-        """
-        return  [instances_num, num_shifts, fixed_num, 2]
+        """v4：在固定采样点上生成双方向闭合线等价点序。
+
+        与 v3 的候选语义相同，但先固定采样再循环移位，不在每次移位后重新按弧长采样。
+        Returns: [N, 2*(P-1), P, 2]。
         """
         fixed_num_sampled_points = self.fixed_num_sampled_points
         instances_list = []
@@ -473,6 +547,8 @@ class LiDARInstanceLines(object):
 
 
 class VectorizedLocalMap(object):
+    #* VAD 使用三类矢量地图实例：divider、ped_crossing 和 boundary。
+    # road_divider/lane_divider 共享 divider 标签；道路/车道面轮廓共享 boundary 标签。
     CLASS2LABEL = {
         'road_divider': 0,
         'lane_divider': 0,
@@ -521,22 +597,31 @@ class VectorizedLocalMap(object):
         '''
         use lidar2global to get gt map layers
         '''
-        
+
+        #*==================== 1. 构造以自车为中心的局部地图范围 ====================#
+        # map_pose 是当前帧 LiDAR/自车在全局地图中的二维位置。
         map_pose = lidar2global_translation[:2]
         rotation = Quaternion(lidar2global_rotation)
 
+        # patch_box=(中心x, 中心y, 高, 宽)，只保留当前感知范围内的地图元素。
         patch_box = (map_pose[0], map_pose[1], self.patch_size[0], self.patch_size[1])
+        # patch_angle 用于把全局地图旋转到当前自车坐标方向。
         patch_angle = quaternion_yaw(rotation) / np.pi * 180
-        # import pdb;pdb.set_trace()
+
+        #*==================== 2. 按类别生成独立矢量地图实例 ====================#
+        # vectors 中每一项为 (LineString实例, 类别标签)。一个实例是一条连续线，
+        # 而不是该类别下所有线的集合。
         vectors = []
         for vec_class in self.vec_classes:
             if vec_class == 'divider':
+                # road_divider/lane_divider：每条裁剪后的连续分隔线是一个实例。
                 line_geom = self.get_map_geom(patch_box, patch_angle, self.line_classes, location)
                 line_instances_dict = self.line_geoms_to_instances(line_geom)     
                 for line_type, instances in line_instances_dict.items():
                     for instance in instances:
                         vectors.append((instance, self.CLASS2LABEL.get(line_type, -1)))
             elif vec_class == 'ped_crossing':
+                # 人行横道原本是 Polygon；合并后提取其外/内轮廓，每条连续轮廓为一个实例。
                 ped_geom = self.get_map_geom(patch_box, patch_angle, self.ped_crossing_classes, location)
                 # ped_vector_list = self.ped_geoms_to_vectors(ped_geom)
                 ped_instance_list = self.ped_poly_geoms_to_instances(ped_geom)
@@ -544,6 +629,7 @@ class VectorizedLocalMap(object):
                 for instance in ped_instance_list:
                     vectors.append((instance, self.CLASS2LABEL.get('ped_crossing', -1)))
             elif vec_class == 'boundary':
+                # road_segment/lane Polygon 先求并集，再把可行驶区域轮廓作为 boundary 实例。
                 polygon_geom = self.get_map_geom(patch_box, patch_angle, self.polygon_classes, location)
                 # import pdb;pdb.set_trace()
                 poly_bound_list = self.poly_geoms_to_instances(polygon_geom)
@@ -553,7 +639,7 @@ class VectorizedLocalMap(object):
             else:
                 raise ValueError(f'WRONG vec_class: {vec_class}')
 
-        # filter out -1
+        #*==================== 3. 过滤无效类别并封装实例列表 ====================#
         filtered_vectors = []
         gt_pts_loc_3d = []
         gt_pts_num_3d = []
@@ -563,7 +649,8 @@ class VectorizedLocalMap(object):
             if type != -1:
                 gt_instance.append(instance)
                 gt_labels.append(type)
-        
+
+        # LiDARInstanceLines 保存所有 LineString，并负责后续固定点采样、方向等价表示等操作。
         gt_instance = LiDARInstanceLines(gt_instance,self.sample_dist,
                         self.num_samples, self.padding, self.fixed_num,self.padding_value, patch_size=self.patch_size)
 
@@ -609,14 +696,17 @@ class VectorizedLocalMap(object):
         return line_vectors
 
     def _one_type_line_geom_to_instances(self, line_geom):
+        """把同一类别的几何结果拆成互相独立的连续线实例。"""
         line_instances = []
-        
+
         for line in line_geom:
             if not line.is_empty:
                 if line.geom_type == 'MultiLineString':
+                    #* 一个 MultiLineString 含多段互不连续的线，每段分别算一个地图实例。
                     for single_line in line.geoms:
                         line_instances.append(single_line)
                 elif line.geom_type == 'LineString':
+                    #* 一个连续 LineString 直接对应一个地图实例。
                     line_instances.append(line)
                 else:
                     raise NotImplementedError
@@ -660,8 +750,9 @@ class VectorizedLocalMap(object):
         return self._one_type_line_geom_to_vectors(results)
 
     def ped_poly_geoms_to_instances(self, ped_geom):
-        # import pdb;pdb.set_trace()
+        """将局部人行横道 Polygon 转换为轮廓线实例。"""
         ped = ped_geom[0][1]
+        #* 先合并重叠/相邻的人行横道面，避免重复边界。
         union_segments = ops.unary_union(ped)
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
@@ -672,12 +763,14 @@ class VectorizedLocalMap(object):
         if union_segments.geom_type != 'MultiPolygon':
             union_segments = MultiPolygon([union_segments])
         for poly in union_segments.geoms:
+            # 每个合并后 Polygon 的外环和内环都可能形成独立轮廓实例。
             exteriors.append(poly.exterior)
             for inter in poly.interiors:
                 interiors.append(inter)
 
         results = []
         for ext in exteriors:
+            # 统一点序方向，并裁剪到以自车为中心的局部感知范围。
             if ext.is_ccw:
                 ext.coords = list(ext.coords)[::-1]
             lines = ext.intersection(local_patch)
@@ -697,8 +790,10 @@ class VectorizedLocalMap(object):
 
 
     def poly_geoms_to_instances(self, polygon_geom):
+        """将 road_segment/lane 面转换为可行驶区域边界线实例。"""
         roads = polygon_geom[0][1]
         lanes = polygon_geom[1][1]
+        #* 道路面与车道面统一求并集；最终取并集轮廓，而非保留每个 Polygon 的内部边界。
         union_roads = ops.unary_union(roads)
         union_lanes = ops.unary_union(lanes)
         union_segments = ops.unary_union([union_roads, union_lanes])
@@ -710,6 +805,7 @@ class VectorizedLocalMap(object):
         if union_segments.geom_type != 'MultiPolygon':
             union_segments = MultiPolygon([union_segments])
         for poly in union_segments.geoms:
+            # 外环表示道路区域外边界，内环表示道路区域中的孔洞边界。
             exteriors.append(poly.exterior)
             for inter in poly.interiors:
                 interiors.append(inter)
@@ -741,6 +837,7 @@ class VectorizedLocalMap(object):
 
         return line_vectors_dict
     def line_geoms_to_instances(self, line_geom):
+        """按原始地图图层分别把 divider 几何拆成连续线实例。"""
         line_instances_dict = dict()
         for line_type, a_type_of_lines in line_geom:
             one_type_instances = self._one_type_line_geom_to_instances(a_type_of_lines)
@@ -813,6 +910,7 @@ class VectorizedLocalMap(object):
         return polygon_list
 
     def get_divider_line(self,patch_box,patch_angle,layer_name,location):
+        """提取并裁剪当前局部范围内的 road/lane divider。"""
         if layer_name not in self.map_explorer[location].map_api.non_geometric_line_layers:
             raise ValueError("{} is not a line layer".format(layer_name))
 
@@ -827,12 +925,15 @@ class VectorizedLocalMap(object):
         line_list = []
         records = getattr(self.map_explorer[location].map_api, layer_name)
         for record in records:
+            # nuScenes 中每条 divider record 通过 line_token 对应一条全局地图线。
             line = self.map_explorer[location].map_api.extract_line(record['line_token'])
             if line.is_empty:  # Skip lines without nodes.
                 continue
 
+            #* 与局部 patch 求交：一个实例只表示该全局线在当前感知范围内的可见部分。
             new_line = line.intersection(patch)
             if not new_line.is_empty:
+                # 转到以自车为原点、车头方向对齐的局部坐标系。
                 new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
                 new_line = affinity.affine_transform(new_line,
                                                      [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
@@ -841,6 +942,7 @@ class VectorizedLocalMap(object):
         return line_list
 
     def get_ped_crossing_line(self, patch_box, patch_angle, location):
+        """提取局部人行横道 Polygon，并转换到自车局部坐标系。"""
         patch_x = patch_box[0]
         patch_y = patch_box[1]
 
@@ -864,11 +966,13 @@ class VectorizedLocalMap(object):
         return polygon_list
 
     def sample_pts_from_line(self, line):
+        """沿一个连续 LineString 按距离或固定数量采样有序二维点。"""
         if self.fixed_num < 0:
+            # 按固定物理间隔 sample_dist 采样，点数随线长变化。
             distances = np.arange(0, line.length, self.sample_dist)
             sampled_points = np.array([list(line.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
         else:
-            # fixed number of points, so distance is line.length / self.fixed_num
+            #* VAD 训练通常使用固定点数 P，使每个地图实例表示为 [P,2]。
             distances = np.linspace(0, line.length, self.fixed_num)
             sampled_points = np.array([list(line.interpolate(distance).coords) for distance in distances]).reshape(-1, 2)
 

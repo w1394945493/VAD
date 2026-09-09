@@ -20,8 +20,8 @@ except ImportError:
 class MapHungarianAssigner3D(BaseAssigner):
     """Computes one-to-one matching between predictions and ground truth.
     This class computes an assignment between the targets and the predictions
-    based on the costs. The costs are weighted sum of three components:
-    classification cost, regression L1 cost and regression iou cost. The
+    based on the costs. The costs are a weighted sum of four components:
+    classification, bbox L1, bbox IoU and ordered-point costs. The
     targets don't include the no_object, so generally there are more
     predictions than targets. After the one-to-one matching, the un-matched
     are treated as backgrounds. Thus each query prediction will be assigned
@@ -58,7 +58,7 @@ class MapHungarianAssigner3D(BaseAssigner):
                bbox_pred,
                cls_pred,
                pts_pred,
-               gt_bboxes, 
+               gt_bboxes,
                gt_labels,
                gt_pts,
                gt_bboxes_ignore=None,
@@ -89,15 +89,49 @@ class MapHungarianAssigner3D(BaseAssigner):
             eps (int | float, optional): A value added to the denominator for
                 numerical stability. Default 1e-7.
         Returns:
-            :obj:`AssignResult`: The assigned result.
+            tuple:
+                - AssignResult：每个预测 query 匹配到的 GT 编号；0 表示背景，
+                  正整数 n 表示第 n-1 个 GT。
+                - order_index [V,G]：每个“预测-GT”组合代价最小的 GT 点序编号。
         """
+        #*==================== 地图预测与 GT 的 Hungarian 匹配 ====================#
+        #* 完整训练逻辑（候选点序生成 -> 匹配 -> 构造 target -> 计算 loss）：
+        #*
+        #* 1) 数据集为每个 GT 地图实例生成 S 种等价有序点表示：
+        #*    开放折线通常包含正序/反序，闭合折线包含不同起点的循环移位点序，
+        #*    得到 gt_pts=[G,S,P_gt,2]。这些候选表示同一个 GT 几何实例，
+        #*    不是 S 个不同 GT，也不是要求网络输出 S 条预测。
+        #* 2) 模型固定输出 V 个地图 query；每个 query 预测类别、包围框和一条有序折线，
+        #*    分别为 cls_pred=[V,C]、bbox_pred=[V,4]、pts_pred=[V,P_pred,2]。
+        #* 3) 若 P_pred != P_gt，先沿点序维将预测折线线性插值为 P_gt 个点。
+        #* 4) 每个预测 query 与每个 GT 的全部 S 个候选点序计算点代价，得到
+        #*    pts_cost_ordered=[V,G,S]；在 S 维取最小值，得到 pts_cost=[V,G]，
+        #*    同时用 order_index=[V,G] 记录每个“预测-GT”组合的最佳候选编号。
+        #* 5) 将点代价与分类、包围框 L1、IoU 代价相加，形成总成本矩阵 cost=[V,G]。
+        #* 6) Hungarian 在 cost 上寻找全局总代价最小的一对一预测-GT配对；匹配 query
+        #*    是正样本，未匹配 query 是背景。注意：候选点序最小化发生在 Hungarian 之前，
+        #*    因此最佳候选的点代价会直接影响实例配对结果。
+        #* 7) 本函数返回 AssignResult 和 order_index。随后 VADHead._map_get_target_single()
+        #*    对每个匹配对 (pred_i,gt_j) 读取 order_index[i,j]，从 gt_pts 中取出该 GT
+        #*    对当前预测最合适的点序，写入 pts_targets；同时构造类别和包围框 targets。
+        #* 8) VADHead.map_loss_single() 最后使用这些 targets 计算分类、框 L1、IoU、
+        #*    PtsL1Loss 和 PtsDirCosLoss；此时匹配与最佳点序选择都已经完成。
+        #*
+        #* 简写：GT候选点序 [G,S,P,2] -> 全组合点代价 [V,G,S]
+        #*      -> 候选维取最小 [V,G] -> 融合各项代价 -> Hungarian 一对一匹配
+        #*      -> 取匹配 GT 的最佳点序 -> 构造 targets -> 计算各项 loss。
+        #*
+        #* V=num_query（固定数量的地图预测），G=num_gt（当前帧真实地图实例数），
+        #* S=num_orders（同一 GT 的等价点序数），P=每种点序的采样点数。
+        #* 先对每个 [预测,GT] 组合从 S 个点序中选出最小点代价，再把该代价与
+        #* 分类、包围框 L1、IoU 代价相加，最后在 [V,G] 代价矩阵上做一对一匹配。
         assert gt_bboxes_ignore is None, \
             'Only case when gt_bboxes_ignore is None is supported.'
         assert bbox_pred.shape[-1] == 4, \
             'Only support bbox pred shape is 4 dims'
         num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
 
-        # 1. assign -1 by default
+        # 1. 初始化为 -1（ignore/尚未分配）；完成匹配后，未匹配 query 会被置为背景 0。
         assigned_gt_inds = bbox_pred.new_full((num_bboxes, ),
                                               -1,
                                               dtype=torch.long)
@@ -112,51 +146,64 @@ class MapHungarianAssigner3D(BaseAssigner):
             return AssignResult(
                 num_gts, assigned_gt_inds, None, labels=assigned_labels), None
 
-        # 2. compute the weighted costs
-        # classification and bboxcost.
-        cls_cost = self.cls_cost(cls_pred, gt_labels)
-        # regression L1 cost
-        
-        normalized_gt_bboxes = normalize_2d_bbox(gt_bboxes, self.pc_range)
+        #*==================== 1. 构造各项 Pred-GT 匹配代价 ====================#
+        # 分类代价：每个预测属于每个 GT 类别的代价，输出 [V,G]。
+        cls_cost = self.cls_cost(cls_pred, gt_labels)  # [V,G]
+        # 预测框是 [0,1] 归一化格式，先把米制 GT 框归一化到同一尺度。
+        normalized_gt_bboxes = normalize_2d_bbox(gt_bboxes, self.pc_range)  # [G,4]
         # normalized_gt_bboxes = gt_bboxes
-        # import pdb;pdb.set_trace()
-        reg_cost = self.reg_cost(bbox_pred[:, :4], normalized_gt_bboxes[:, :4])
+        # 包围框 L1 代价：逐一比较 V 个预测框与 G 个 GT 框，输出 [V,G]。
+        reg_cost = self.reg_cost(
+            bbox_pred[:, :4], normalized_gt_bboxes[:, :4])  # [V,G]
 
+        # gt_pts=[G,S,P_gt,2]：每个 GT 含 S 种等价点序；2=(x,y)。
         _, num_orders, num_pts_per_gtline, num_coords = gt_pts.shape
-        normalized_gt_pts = normalize_2d_pts(gt_pts, self.pc_range)
+        normalized_gt_pts = normalize_2d_pts(gt_pts, self.pc_range)  # [G,S,P_gt,2]
         num_pts_per_predline = pts_pred.size(1)
+        # 若预测点数 P_pred 与 GT 点数 P_gt 不同，沿点序维重采样预测折线。
         if num_pts_per_predline != num_pts_per_gtline:
-            pts_pred_interpolated = F.interpolate(pts_pred.permute(0,2,1),size=(num_pts_per_gtline),
-                                            mode='linear', align_corners=True)
-            pts_pred_interpolated = pts_pred_interpolated.permute(0,2,1).contiguous()
+            pts_pred_interpolated = F.interpolate(
+                pts_pred.permute(0, 2, 1), size=num_pts_per_gtline,
+                mode='linear', align_corners=True)  # [V,2,P_gt]
+            pts_pred_interpolated = \
+                pts_pred_interpolated.permute(0, 2, 1).contiguous()  # [V,P_gt,2]
         else:
-            pts_pred_interpolated = pts_pred
-        # num_q, num_pts, 2 <-> num_gt, num_pts, 2
+            pts_pred_interpolated = pts_pred  # [V,P_gt,2]
+
+        #* 每个预测都与每个 GT 的所有 S 种候选点序计算点集匹配代价。
+        # self.pts_cost 的展平输出随后恢复为 [V,G,S]。
         pts_cost_ordered = self.pts_cost(pts_pred_interpolated, normalized_gt_pts)
-        pts_cost_ordered = pts_cost_ordered.view(num_bboxes, num_gts, num_orders)
-        pts_cost, order_index = torch.min(pts_cost_ordered, 2)
-        
-        bboxes = denormalize_2d_bbox(bbox_pred, self.pc_range)
-        iou_cost = self.iou_cost(bboxes, gt_bboxes)
-        # weighted sum of above three costs
-        cost = cls_cost + reg_cost + iou_cost + pts_cost
-        
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
+        pts_cost_ordered = pts_cost_ordered.view(
+            num_bboxes, num_gts, num_orders)  # [V,G,S]
+        # 在 S 维取最小值：pts_cost 是参与 Hungarian 的最佳点序代价；
+        # order_index 保存最佳候选编号，匹配完成后据此构造 pts_targets。
+        pts_cost, order_index = torch.min(pts_cost_ordered, dim=2)  # 均为 [V,G]
+
+        # IoU 代价在米制坐标下计算，因此先反归一化预测框。
+        bboxes = denormalize_2d_bbox(bbox_pred, self.pc_range)  # [V,4]
+        iou_cost = self.iou_cost(bboxes, gt_bboxes)  # [V,G]
+        # 各 cost 对象内部已包含配置中的权重；相加得到最终 [V,G] 代价矩阵。
+        cost = cls_cost + reg_cost + iou_cost + pts_cost  # [V,G]
+
+        #*==================== 2. Hungarian 实例级一对一匹配 ====================#
+        # scipy 在 CPU 上求使总代价最小的预测-GT 配对；一个预测和一个 GT 最多使用一次。
         cost = cost.detach().cpu()
         if linear_sum_assignment is None:
             raise ImportError('Please run "pip install scipy" '
                               'to install scipy first.')
         matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
+        # matched_row_inds=预测 query 编号；matched_col_inds=与其匹配的 GT 编号。
         matched_row_inds = torch.from_numpy(matched_row_inds).to(
             bbox_pred.device)
         matched_col_inds = torch.from_numpy(matched_col_inds).to(
             bbox_pred.device)
 
-        # 4. assign backgrounds and foregrounds
-        # assign all indices to backgrounds first
+        #*==================== 3. 记录匹配结果 ====================#
+        # 先将所有 query 设为背景 0，再把匹配成功者设为对应 GT 的 1-based 编号。
         assigned_gt_inds[:] = 0
-        # assign foregrounds based on matching results
         assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
         assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
+        # AssignResult 决定正/负样本；order_index 供 VADHead 为正样本选出最佳 GT 点序。
         return AssignResult(
-            num_gts, assigned_gt_inds, None, labels=assigned_labels), order_index
+            num_gts, assigned_gt_inds, None,
+            labels=assigned_labels), order_index

@@ -231,17 +231,17 @@ class VAD(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
 
+        # * 多帧、多视角图像输入：拆分历史帧和当前帧
         len_queue = img.size(1)
         prev_img = img[:, :-1, ...]
         img = img[:, -1, ...]
 
         prev_img_metas = copy.deepcopy(img_metas)
-        # prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
-        # import pdb;pdb.set_trace()
+        # * 生成逐帧历史BEV特征
         prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) if len_queue > 1 else None
 
         img_metas = [each[len_queue-1] for each in img_metas]
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_feats = self.extract_feat(img=img, img_metas=img_metas) # * 提取度视角图像特征
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d, gt_labels_3d,
                                             map_gt_bboxes_3d, map_gt_labels_3d, img_metas,
