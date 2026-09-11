@@ -519,7 +519,7 @@ class VADHead(DETRHead):
         dtype = mlvl_feats[0].dtype
 
         # 目标查询（论文中的 agent queries）：用于检测场景中的动态交通参与者。
-        object_query_embeds = self.query_embedding.weight.to(dtype)
+        object_query_embeds = self.query_embedding.weight.to(dtype) # (300 512)
 
         # 地图查询（map queries）有两种构造方式：
         # 1) all_pts：直接学习 [V*P,2D]，每个地图采样点都有独立的完整查询；
@@ -528,17 +528,17 @@ class VADHead(DETRHead):
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
         elif self.map_query_embed_type == 'instance_pts':
-            map_pts_embeds = self.map_pts_embedding.weight.unsqueeze(0)
-            map_instance_embeds = self.map_instance_embedding.weight.unsqueeze(1)
-            map_query_embeds = (map_pts_embeds + map_instance_embeds).flatten(0, 1).to(dtype)
+            map_pts_embeds = self.map_pts_embedding.weight.unsqueeze(0) # (1 20 512)
+            map_instance_embeds = self.map_instance_embedding.weight.unsqueeze(1) # (100 1 512)
+            map_query_embeds = (map_pts_embeds + map_instance_embeds).flatten(0, 1).to(dtype) # (2000 512)
 
         # BEV 网格上的可学习查询，用它们从多相机图像特征中聚合 BEV 特征。
-        bev_queries = self.bev_embedding.weight.to(dtype)
+        bev_queries = self.bev_embedding.weight.to(dtype) # (10000 256)
 
         # 为 BEV 网格生成位置编码，使查询带有二维空间位置信息。
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
-                               device=bev_queries.device).to(dtype)
-        bev_pos = self.positional_encoding(bev_mask).to(dtype)
+                               device=bev_queries.device).to(dtype) # (1 100 100)
+        bev_pos = self.positional_encoding(bev_mask).to(dtype) # (1 256 100 100)
 
         #*==================== 2. 图像特征投影与 Transformer 解码 ====================#
         # 处理历史帧时只运行 BEV Encoder，返回的 BEV 会作为当前帧的 prev_bev。
@@ -582,10 +582,10 @@ class VADHead(DETRHead):
 
         #* 拆分 Transformer 输出；每个返回值使用的维度缩写紧跟在对应 shape 后解释。
         (
-            bev_embed,             # BEV memory，[HW,B,D]；HW=bev_h*bev_w，B=批大小，D=特征维度
-            hs,                    # Agent特征，[Ld,A,B,D]；Ld=Agent解码层数，A=Agent Query数，B=批大小，D=特征维度
-            init_reference,        # Agent初始点(x,y,z)，[B,A,3]；B=批大小，A=Agent Query数
-            inter_references,      # Agent更新点，[Ld,B,A,3]；Ld=Agent解码层数，B=批大小，A=Agent Query数
+            bev_embed,             # (1000 1 256) # BEV memory，[HW,B,D]；HW=bev_h*bev_w，B=批大小，D=特征维度
+            hs,                    # (3 300 1 256) # Agent特征，[Ld,A,B,D]；Ld=Agent解码层数，A=Agent Query数，B=批大小，D=特征维度
+            init_reference,        # (1 300 3) # Agent初始点(x,y,z)，[B,A,3]；B=批大小，A=Agent Query数
+            inter_references,      # (3 1 30 3) # Agent更新点，[Ld,B,A,3]；Ld=Agent解码层数，B=批大小，A=Agent Query数
             map_hs,                # Map点特征，[Lm,V*P,B,D]；Lm=Map解码层数，V=实例数，P=每实例点数，B=批大小，D=特征维度
             map_init_reference,    # Map初始点(x,y)，[B,V*P,2]；B=批大小，V=地图实例数，P=每实例点数
             map_inter_references,  # Map更新点，[Lm,B,V*P,2]；Lm=Map解码层数，B=批大小，V=实例数，P=每实例点数
