@@ -1404,16 +1404,16 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             prev_idx=info['prev'],
             next_idx=info['next'],
             scene_token=info['scene_token'],
-            can_bus=info['can_bus'],
+            can_bus=info['can_bus'], # (18,)
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'] / 1e6,
-            fut_valid_flag=info['fut_valid_flag'],
-            map_location=info['map_location'],
-            ego_his_trajs=info['gt_ego_his_trajs'],
-            ego_fut_trajs=info['gt_ego_fut_trajs'],
-            ego_fut_masks=info['gt_ego_fut_masks'],
-            ego_fut_cmd=info['gt_ego_fut_cmd'],
-            ego_lcf_feat=info['gt_ego_lcf_feat']
+            fut_valid_flag=info['fut_valid_flag'], # bool,true
+            map_location=info['map_location'], # str,eg.:'singapore-onenorth'
+            ego_his_trajs=info['gt_ego_his_trajs'], # (2,2)
+            ego_fut_trajs=info['gt_ego_fut_trajs'], # (6,2)
+            ego_fut_masks=info['gt_ego_fut_masks'], # (6,)
+            ego_fut_cmd=info['gt_ego_fut_cmd'], # (3,)
+            ego_lcf_feat=info['gt_ego_lcf_feat'] # (9,)
         )
         # lidar to ego transform
         lidar2ego = np.eye(4).astype(np.float32)
