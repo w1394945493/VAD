@@ -29,6 +29,7 @@ nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
 
 ego_width, ego_length = 1.85, 4.084
 
+# *1. 基础数学工具：四元数/欧拉角转换，以及按时间戳匹配最近的 CAN bus 消息。
 def quart_to_rpy(qua):
     x, y, z, w = qua
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
@@ -61,11 +62,15 @@ def create_nuscenes_infos(root_path,
         max_sweeps (int): Max number of sweeps.
             Default: 10
     """
+    # *==============================================================#
+    # *1. 初始化 nuScenes 主数据库和 CAN bus expansion 数据接口。
     from nuscenes.nuscenes import NuScenes
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
     print(version, root_path)
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
     nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    # *==============================================================#
+    # *2. 根据数据版本取得官方 train/val/test 场景名称划分。
     from nuscenes.utils import splits
     available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
     assert version in available_vers
@@ -81,7 +86,8 @@ def create_nuscenes_infos(root_path,
     else:
         raise ValueError('unknown')
 
-    # filter existing scenes.
+    # *==============================================================#
+    # *3. 检查本地 LiDAR 文件，只保留数据实际存在的场景，并把场景名称转换成 scene token。
     available_scenes = get_available_scenes(nusc)
     available_scene_names = [s['name'] for s in available_scenes]
     train_scenes = list(
@@ -102,10 +108,12 @@ def create_nuscenes_infos(root_path,
     else:
         print('train scene: {}, val scene: {}'.format(
             len(train_scenes), len(val_scenes)))
-
+    # *==============================================================#
+    # *4. 遍历全部 key frame，生成相机/点云标定、目标标注、轨迹和规划标签等逐帧 info。
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
         nusc, nusc_can_bus, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
-
+    # *==============================================================#
+    # *5. 按版本写出 temporal_train/val/test.pkl；顶层格式为 {'infos': list, 'metadata': dict}。
     metadata = dict(version=version)
     if test:
         print('test sample: {}'.format(len(train_nusc_infos)))
@@ -139,6 +147,7 @@ def get_available_scenes(nusc):
         available_scenes (list[dict]): List of basic information for the
             available scenes.
     """
+    # *1. 遍历 scene，并定位每个场景首个 sample 的 LIDAR_TOP 数据。
     available_scenes = []
     print('total scene num: {}'.format(len(nusc.scene)))
     for scene in nusc.scene:
@@ -148,6 +157,7 @@ def get_available_scenes(nusc):
         sd_rec = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
         has_more_frames = True
         scene_not_exist = False
+        # *2. 检查对应点云文件是否真实存在；缺文件的 scene 不参与后续 pkl 生成。
         while has_more_frames:
             lidar_path, boxes, _ = nusc.get_sample_data(sd_rec['token'])
             lidar_path = str(lidar_path)
@@ -168,12 +178,14 @@ def get_available_scenes(nusc):
 
 
 def _get_can_bus_info(nusc, nusc_can_bus, sample):
+    # *1. 使用 sample 所属 scene 名称读取该场景的 CAN bus pose 消息序列。
     scene_name = nusc.get('scene', sample['scene_token'])['name']
     sample_timestamp = sample['timestamp']
     try:
         pose_list = nusc_can_bus.get_messages(scene_name, 'pose')
     except:
         return np.zeros(18)  # server scenes do not have can bus information.
+    # *2. 在有序消息中寻找时间上最接近当前 sample 的 pose；若 CAN bus 不可用则返回全零特征。
     can_bus = []
     # during each scene, the first timestamp of can_bus may be large than the first sample's timestamp
     last_pose = pose_list[0]
@@ -181,6 +193,7 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
         if pose['utime'] > sample_timestamp:
             break
         last_pose = pose
+    # *3. 按 BEVFormer/VAD 约定把位置、四元数和运动状态打包，并预留两个航向角槽位，共 18 维。
     _ = last_pose.pop('utime')  # useless
     pos = last_pose.pop('pos')
     rotation = last_pose.pop('orientation')
@@ -214,37 +227,61 @@ def _fill_trainval_infos(nusc,
         tuple[list[dict]]: Information of training set and validation set
             that will be saved to the info file.
     """
+    # *==============================================================#
+    # *1. 初始化输出容器，并建立 nuScenes 原始类别名称到整数类别 ID 的映射。
     train_nusc_infos = []
     val_nusc_infos = []
     frame_idx = 0
     cat2idx = {}
     for idx, dic in enumerate(nusc.category):
         cat2idx[dic['name']] = idx
-
+    # *==============================================================#
+    # *2. 逐个遍历 nuScenes key frame；每个 sample 最终对应 pkl 中的一条 info。
     for sample in mmcv.track_iter_progress(nusc.sample):
+        # *2.1 读取当前帧的地图区域、LIDAR_TOP 标定、ego pose，以及相邻帧 ego pose。
         map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
         lidar_token = sample['data']['LIDAR_TOP']
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
         cs_record = nusc.get('calibrated_sensor',
                              sd_rec['calibrated_sensor_token'])
         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+
+        # *============================================================#
+        #* sample['prev'] 和 sample['next'] 保存的是同一 scene 中相邻 nuScenes key frame 的
+        #* sample token，而不是列表下标：prev 指向上一关键帧，next 指向下一关键帧。
+        #* 场景首帧没有上一帧，因此 prev == ''；场景末帧没有下一帧，因此 next == ''。
+        #* 这里按 sample token 查询相邻 sample，再取其 LIDAR_TOP sample_data，最后利用
+        #* sample_data['ego_pose_token'] 取得该 LiDAR 采集时刻的自车位置和朝向。
+        #* 这些相邻 key frame ego pose 后续用于估算自车速度和 yaw_rate；nuScenes key frame
+        #* 通常间隔约 0.5 s。注意这里的 sample.prev/next 不同于后面用于收集高频 LiDAR
+        #* 历史 sweep 的 sample_data.prev：前者连接关键帧，后者连接同一传感器的数据帧。
         if sample['prev'] != '':
+            #* 非场景首帧：上一 key frame sample -> 上一帧 LIDAR_TOP -> 上一帧 ego pose。
             sample_prev = nusc.get('sample', sample['prev'])
             sd_rec_prev = nusc.get('sample_data', sample_prev['data']['LIDAR_TOP'])
             pose_record_prev = nusc.get('ego_pose', sd_rec_prev['ego_pose_token'])
         else:
+            #* 场景首帧无 previous，后续运动状态估算会改用当前帧与下一帧。
             pose_record_prev = None
         if sample['next'] != '':
+            #* 非场景末帧：下一 key frame sample -> 下一帧 LIDAR_TOP -> 下一帧 ego pose。
             sample_next = nusc.get('sample', sample['next'])
             sd_rec_next = nusc.get('sample_data', sample_next['data']['LIDAR_TOP'])
             pose_record_next = nusc.get('ego_pose', sd_rec_next['ego_pose_token'])
         else:
+            #* 场景末帧无 next；未来轨迹生成时会据此停止并将后续 mask 置为无效。
             pose_record_next = None
 
+        # *2.2 读取当前 LiDAR 文件路径、3D GT box，并匹配当前时刻的 CAN bus 状态。
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
         mmcv.check_file_exist(lidar_path)
         can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample)
+
+        # *==============================================================#
+        #* fut_valid_flag 是 VAD 额外生成的“完整未来是否可用”标志：从当前 sample 沿 next
+        #* 连续检查 fut_ts（默认 6）个 key frame。只要场景在预测范围内提前结束，就置 False。
+        #* 注意它是整段轨迹级别的 bool；逐时间步是否有效由后面的 gt_ego_fut_masks 表示。
         fut_valid_flag = True
         test_sample = copy.deepcopy(sample)
         for i in range(fut_ts):
@@ -252,7 +289,8 @@ def _fill_trainval_infos(nusc,
                 test_sample = nusc.get('sample', test_sample['next'])
             else:
                 fut_valid_flag = False
-        ##
+        # *==============================================================#
+        # *3. 建立当前帧 info 的基础部分：token、时序关系、标定、位姿、时间戳和地图区域。
         info = {
             'lidar_path': lidar_path,
             'token': sample['token'],
@@ -271,7 +309,8 @@ def _fill_trainval_infos(nusc,
             'fut_valid_flag': fut_valid_flag,
             'map_location': map_location
         }
-
+        # *==============================================================#
+        # *4. 更新场景内帧编号：遇到场景末帧后清零，否则递增。
         if sample['next'] == '':
             frame_idx = 0
         else:
@@ -283,8 +322,8 @@ def _fill_trainval_infos(nusc,
         e2g_t = info['ego2global_translation']
         l2e_r_mat = Quaternion(l2e_r).rotation_matrix
         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
-
-        # obtain 6 image's information per frame
+        # *==============================================================#
+        # *5. 收集六路相机信息，并计算每个相机到当前 LIDAR_TOP 的外参及相机内参。
         camera_types = [
             'CAM_FRONT',
             'CAM_FRONT_RIGHT',
@@ -300,8 +339,8 @@ def _fill_trainval_infos(nusc,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
             info['cams'].update({cam: cam_info})
-
-        # obtain sweeps for a single key-frame
+        # *==============================================================#
+        # *6. 沿 LIDAR_TOP sample_data.prev 收集最多 max_sweeps 个历史点云及其到当前帧的变换。
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
         sweeps = []
         while len(sweeps) < max_sweeps:
@@ -313,8 +352,12 @@ def _fill_trainval_infos(nusc,
             else:
                 break
         info['sweeps'] = sweeps
-        # obtain annotation
+
+        # *==============================================================#
+        # *7. train/val 才生成监督标注；test 无公开 GT，因此只保留前面的传感器和时序信息。
         if not test:
+            # *==============================================================#
+            # *7.1 读取当前 sample 的全部 3D annotation，生成 box、类别、速度和有效性标志。
             annotations = [
                 nusc.get('sample_annotation', token)
                 for token in sample['anns']
@@ -329,7 +372,9 @@ def _fill_trainval_infos(nusc,
                 [(anno['num_lidar_pts'] + anno['num_radar_pts']) > 0
                  for anno in annotations],
                 dtype=bool).reshape(-1)
-            # convert velo from global to lidar
+
+            # *==============================================================#
+            # *7.2 将目标速度从 global 坐标系旋转到当前 LiDAR 坐标系。
             for i in range(len(boxes)):
                 velo = np.array([*velocity[i], 0.0])
                 velo = velo @ np.linalg.inv(e2g_r_mat).T @ np.linalg.inv(
@@ -341,64 +386,144 @@ def _fill_trainval_infos(nusc,
                 if names[i] in NuScenesDataset.NameMapping:
                     names[i] = NuScenesDataset.NameMapping[names[i]]
             names = np.array(names)
-            # we need to convert rot to SECOND format.
+
+            # *==============================================================#
+            # *7.3 将 nuScenes Box 整理成 SECOND/mmdet3d 的 7 维 LiDAR box 表示。
+            #*
+            #* 转换前，前面三组数组分别是：
+            #*   locs: (N, 3)，每个 box 在当前 LIDAR_TOP 坐标系中的中心 [x, y, z]；
+            #*   dims: (N, 3)，nuScenes Box.wlh 给出的尺寸 [width, length, height]；
+            #*   rots: (N, 1)，nuScenes Box 的 yaw（orientation.yaw_pitch_roll[0]），单位 rad。
+            #*
+            #* 转换后，每行 gt_boxes 为：
+            #*   [x, y, z, width, length, height, yaw_mmdet]，形状为 (N, 7)。
+            #* 这里 locs 和 dims 直接拼接，没有交换尺寸列；关键转换发生在 yaw：
+            #*
+            #*   yaw_mmdet = -yaw_nuscenes - pi/2
+            #*
+            #* 其中负号用于对齐两套 box 对旋转正方向的定义，额外的 -pi/2 用于对齐
+            #* nuScenes Box.wlh 与 SECOND/mmdet3d 对“零航向及长宽轴”的定义。二者共同保证
+            #* 转换后的 3D box 在 LiDAR 坐标系中仍覆盖同一物理物体，而不是把物体真的旋转。
+            #* 例如 nuScenes yaw=0 时，这里得到 mmdet yaw=-pi/2；这是同一 box 的不同参数化。
             gt_boxes = np.concatenate([locs, dims, -rots - np.pi / 2], axis=1)
+            #* boxes 与 annotations 都由当前 sample 的 GT 产生，数量和顺序必须一一对应；
+            #* 后续才能用同一个下标拼接类别、速度、有效标志和未来轨迹。
             assert len(gt_boxes) == len(
                 annotations), f'{len(gt_boxes)}, {len(annotations)}'
-            
-            # get future coords for each box
-            # [num_box, fut_ts*2]
+
+            # *==============================================================#
+            # *8. 沿每个实例 annotation.next 追踪未来运动，生成周围目标的轨迹、mask、yaw 和低层特征。
+            #* nuScenes 不需要用几何距离做跨帧匹配：同一个物体在不同 key frame 中的
+            #* sample_annotation 已经通过 prev/next 串成实例链。因此从当前 anno 开始不断读取
+            #* cur_anno['next']，就能取得这个物体在下一帧、下两帧……的真实标注。
+            #* 这里追踪的是当前帧实际存在的 num_box 个目标，每个目标最多向未来追踪
+            #* fut_ts（默认 6）个 key frame，约对应未来 3 秒。
+            #*
+            # *8.1 为所有目标预分配未来监督数组。
+            #*   gt_fut_trajs: (N, 6, 2)，相邻未来时刻的中心位移 [dx, dy]；
+            #*   gt_fut_yaw:   (N, 6)，相邻未来时刻的 yaw 变化量；
+            #*   gt_fut_masks: (N, 6)，该目标在对应未来时刻是否仍有有效 annotation；
+            #*   gt_fut_goal:  (N,)，根据整段未来运动方向生成的离散目标类别。
+            #* 数组先初始化为 0，所以实例提前消失或追踪链结束后，剩余轨迹/mask/yaw 自然保持 0。
             num_box = len(boxes)
-            gt_fut_trajs = np.zeros((num_box, fut_ts, 2))
-            gt_fut_yaw = np.zeros((num_box, fut_ts))
-            gt_fut_masks = np.zeros((num_box, fut_ts))
+            gt_fut_trajs = np.zeros((num_box, fut_ts, 2)) # (N 6 2)
+            gt_fut_yaw = np.zeros((num_box, fut_ts)) # (N 6)
+            gt_fut_masks = np.zeros((num_box, fut_ts)) # (N)
+            #* gt_boxes 中 yaw_mmdet = -yaw_nuscenes-pi/2，这里执行逆关系恢复当前 box 的
+            #* nuScenes/LiDAR yaw，作为 agent_lcf_feat 中的朝向特征。
             gt_boxes_yaw = -(gt_boxes[:,6] + np.pi / 2)
-            # agent lcf feat (x, y, yaw, vx, vy, width, length, height, type)
+            #* 当前帧每个目标的 9 维低层特征：
+            #* [x, y, yaw, vx, vy, width, length, height, category_id]。
             agent_lcf_feat = np.zeros((num_box, 9))
             gt_fut_goal = np.zeros((num_box))
             for i, anno in enumerate(annotations):
+                #* boxes[i] 与 annotations[i] 一一对应。cur_box/cur_anno 表示追踪链的“当前节点”；
+                #* 首次进入循环时是 t=0 当前帧，之后每轮更新为刚取得的未来帧节点。
                 cur_box = boxes[i]
                 cur_anno = anno
-                agent_lcf_feat[i, 0:2] = cur_box.center[:2]	
+                #* agent_lcf_feat 只描述 t=0 的目标状态，不会随下面的未来追踪循环更新。
+                agent_lcf_feat[i, 0:2] = cur_box.center[:2]
                 agent_lcf_feat[i, 2] = gt_boxes_yaw[i]
                 agent_lcf_feat[i, 3:5] = velocity[i]
-                agent_lcf_feat[i, 5:8] = anno['size'] # width,length,height
-                agent_lcf_feat[i, 8] = cat2idx[anno['category_name']] if anno['category_name'] in cat2idx.keys() else -1
+                agent_lcf_feat[i, 5:8] = anno['size']  # [width, length, height]
+                agent_lcf_feat[i, 8] = (
+                    cat2idx[anno['category_name']]
+                    if anno['category_name'] in cat2idx.keys() else -1)
+
+                #* 内层循环只追踪外层第 i 个物体，不是遍历未来帧中的所有目标。
+                #* cur_anno 从该物体 t0 时刻的 annotation 开始，每轮沿 annotation.next
+                #* 前进到同一 instance 的下一条关键帧标注。默认 fut_ts=6、关键帧约间隔 0.5 s：
+                #*   j=0：检查 t0 -> t1（未来约 0.5 s），保存 position(t1)-position(t0)；
+                #*   j=1：检查 t1 -> t2（未来约 1.0 s），保存 position(t2)-position(t1)；
+                #*   ...
+                #*   j=5：检查 t5 -> t6（未来约 3.0 s），保存 position(t6)-position(t5)。
+                #* 因此一次完整循环得到该物体未来 6 步的“逐步位移”，而不是 6 个绝对位置。
+                #* cur_anno['next'] 是同一物体的下一条 annotation token；它不同于
+                #* sample['next']（后者表示整个场景的下一关键帧 sample token）。
                 for j in range(fut_ts):
+                    #* next 非空说明同一物体还有下一时刻 GT，可继续生成第 j 步轨迹监督；
+                    #* next 为空则说明实例链已经结束，剩余未来步无法提供有效监督。
                     if cur_anno['next'] != '':
+                        #* annotation.next 指向同一 instance 在下一个有标注 key frame 中的 annotation，
+                        #* 因此这里无需使用 box IoU、距离或 tracking ID 再做一次数据关联。
                         anno_next = nusc.get('sample_annotation', cur_anno['next'])
+                        #* annotation 的 translation/rotation 原生表达在 global 坐标系；先据此构造
+                        #* 下一时刻的 global Box。
                         box_next = Box(
                             anno_next['translation'], anno_next['size'], Quaternion(anno_next['rotation'])
                         )
-                        # Move box to ego vehicle coord system.
+                        #* global ->“当前 t=0 帧”ego。这里始终使用外层当前 sample 的 pose_record，
+                        #* 而不是未来帧 ego pose，使所有未来 box 都落在同一个固定参考坐标系中。
                         box_next.translate(-np.array(pose_record['translation']))
                         box_next.rotate(Quaternion(pose_record['rotation']).inverse)
-                        #  Move box to sensor coord system.
+                        #* 当前帧 ego -> 当前帧 LIDAR_TOP。至此，box_next 与 cur_box 均表达在
+                        #* 当前 t=0 LiDAR 坐标系，二者中心可以直接相减。
                         box_next.translate(-np.array(cs_record['translation']))
                         box_next.rotate(Quaternion(cs_record['rotation']).inverse)
+                        #* 保存一步增量，而非相对 t=0 的累计位移：
+                        #*   j=0: position(t1)-position(t0)
+                        #*   j=1: position(t2)-position(t1)，依此类推。
                         gt_fut_trajs[i, j] = box_next.center[:2] - cur_box.center[:2]
+                        #* 能取得下一 annotation，说明第 j 个未来监督有效。
                         gt_fut_masks[i, j] = 1
-                        # add yaw diff
+                        #* 同样保存相邻时刻 yaw 增量 yaw(t+j+1)-yaw(t+j)。
                         _, _, box_yaw = quart_to_rpy([cur_box.orientation.x, cur_box.orientation.y,
                                                       cur_box.orientation.z, cur_box.orientation.w])
                         _, _, box_yaw_next = quart_to_rpy([box_next.orientation.x, box_next.orientation.y,
                                                            box_next.orientation.z, box_next.orientation.w])
                         gt_fut_yaw[i, j] = box_yaw_next - box_yaw
+                        #* 沿实例链向前移动一步；下一轮将继续寻找 t+j+2。
                         cur_anno = anno_next
                         cur_box = box_next
                     else:
+                        #* next == '' 表示该实例已没有后续标注（场景结束或目标不再存在）。
+                        #* 剩余轨迹显式补 0；mask/yaw 初始化时已经是 0，无需再次赋值。
                         gt_fut_trajs[i, j:] = 0
                         break
-                # get agent goal
+                # *==============================================================#
+                # *8.2 将逐步位移累加成相对轨迹，再把整段运动方向量化为 goal 类别。
+                #* cumsum 后 gt_fut_coords[k] 表示从 t=0 累积到第 k+1 个未来时刻的位置偏移。
                 gt_fut_coords = np.cumsum(gt_fut_trajs[i], axis=-2)
+                #* 当前实现用“最后累计点 - 第一个累计点”计算方向，相当于 t1 到最后有效/补齐
+                #* 时刻的位移，而不是严格的 t0 到末时刻位移。
                 coord_diff = gt_fut_coords[-1] - gt_fut_coords[0]
-                if coord_diff.max() < 1.0: # static
+                #* 注意：代码使用 coord_diff.max() < 1.0 判静止，并非位移范数，也没有取绝对值；
+                #* 这里保留原实现，仅说明其实际判定规则。
+                if coord_diff.max() < 1.0:  # static
                     gt_fut_goal[i] = 9
                 else:
+                    #* atan2 得到运动方向角，加 pi 将范围平移到约 [0, 2*pi]；再以 pi/4
+                    #* 为间隔整除，量化为八个 45° 方向 bin。极端边界值可能得到类别 8，
+                    #* 静止类别固定为 9，这与原代码注释中的 0-8 范围保持一致。
                     box_mot_yaw = np.arctan2(coord_diff[1], coord_diff[0]) + np.pi
                     gt_fut_goal[i] = box_mot_yaw // (np.pi / 4)  # 0-8: goal direction class
 
-            # get ego history traj (offset format)
+            # *9. 生成自车历史轨迹 gt_ego_his_trajs。
+            #*==================== 自车历史轨迹 gt_ego_his_trajs ====================#
+            #* 原始来源：各历史 sample 的 ego_pose 与 LIDAR_TOP calibrated_sensor。
+            #* get_global_sensor_pose() 返回该帧 LiDAR 原点在 global 坐标系中的 4x4 位姿；
+            #* 此处先保存当前帧以及之前 his_ts（默认 2）帧的 global 三维位置，共 his_ts+1 个点。
+            #* 若场景开头缺少历史帧，则使用最早已知帧的位移差向前线性外推，保持固定长度。
             ego_his_trajs = np.zeros((his_ts+1, 3))
             ego_his_trajs_diff = np.zeros((his_ts+1, 3))
             sample_cur = sample
@@ -416,18 +541,24 @@ def _fill_trainval_infos(nusc,
                 else:
                     ego_his_trajs[i] = ego_his_trajs[i+1] - ego_his_trajs_diff[i+1]
                     ego_his_trajs_diff[i] = ego_his_trajs_diff[i+1]
-            
-            # global to ego at lcf
+
+            #* 将所有历史 global 位置统一变换到“当前帧”的 ego 坐标系：先减当前 ego
+            #* 在 global 中的平移，再乘当前 ego2global 旋转的逆矩阵。
             ego_his_trajs = ego_his_trajs - np.array(pose_record['translation'])
             rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
             ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
-            # ego to lidar at lcf
+            #* 再从当前 ego 坐标系变换到当前 LIDAR_TOP 坐标系。
             ego_his_trajs = ego_his_trajs - np.array(cs_record['translation'])
             rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
             ego_his_trajs = np.dot(rot_mat, ego_his_trajs.T).T
+            #* 相邻位置作差，将 his_ts+1 个绝对位置转成 his_ts 个逐步位移；最终只保存 xy，
+            #* 所以 gt_ego_his_trajs 默认形状为 (2, 2)，每行表示一段 (dx, dy)，单位 m。
             ego_his_trajs = ego_his_trajs[1:] - ego_his_trajs[:-1]
 
-            # get ego futute traj (offset format)
+            # *10. 生成自车未来轨迹 gt_ego_fut_trajs 及逐步有效掩码 gt_ego_fut_masks。
+            #*==================== 自车未来轨迹及掩码 ====================#
+            #* 从当前 sample 沿 next 读取未来 fut_ts（默认 6）帧。为计算相邻位移，需要包括
+            #* 当前时刻在内的 fut_ts+1 个位置，因此初始数组形状为 (7, 3)。
             ego_fut_trajs = np.zeros((fut_ts+1, 3))
             ego_fut_masks = np.zeros((fut_ts+1))
             sample_cur = sample
@@ -436,31 +567,47 @@ def _fill_trainval_infos(nusc,
                 ego_fut_trajs[i] = pose_mat[:3, 3]
                 ego_fut_masks[i] = 1
                 if sample_cur['next'] == '':
+                    #* 场景提前结束时，用最后一个有效位置填充剩余位置，之后作差会得到零位移；
+                    #* 对应的 mask 保持 0，训练时可忽略这些补齐时间步。
                     ego_fut_trajs[i+1:] = ego_fut_trajs[i]
                     break
                 else:
                     sample_cur = nusc.get('sample', sample_cur['next'])
-            # global to ego at lcf
+            #* 与历史轨迹相同：把所有未来 global 位置统一表达在当前帧 ego 坐标系中。
             ego_fut_trajs = ego_fut_trajs - np.array(pose_record['translation'])
             rot_mat = Quaternion(pose_record['rotation']).inverse.rotation_matrix
             ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
-            # ego to lidar at lcf
+            #* 当前帧 ego -> 当前帧 LIDAR_TOP，得到以当前 LiDAR 为原点的未来位置序列。
             ego_fut_trajs = ego_fut_trajs - np.array(cs_record['translation'])
             rot_mat = Quaternion(cs_record['rotation']).inverse.rotation_matrix
             ego_fut_trajs = np.dot(rot_mat, ego_fut_trajs.T).T
-            # drive command according to final fut step offset from lcf
+
+            # *11. 根据 GT 未来终点横向偏移生成三分类驾驶指令 gt_ego_fut_cmd。
+            #*==================== 驾驶指令 gt_ego_fut_cmd ====================#
+            #* 这是 VAD 从 GT 未来轨迹派生的伪标签，并非 nuScenes 直接提供的导航命令。
+            #* 判定发生在逐步差分之前：ego_fut_trajs[-1][0] 是最后一个未来位置相对当前
+            #* LiDAR 原点的 x 偏移。按本项目约定，以 +/-2 m 为阈值生成 3 维 one-hot：
+            #*   x >=  2 m -> [1, 0, 0]（Turn Right，右转）
+            #*   x <= -2 m -> [0, 1, 0]（Turn Left，左转）
+            #*   其余       -> [0, 0, 1]（Go Straight，直行）
             if ego_fut_trajs[-1][0] >= 2:
                 command = np.array([1, 0, 0])  # Turn Right
             elif ego_fut_trajs[-1][0] <= -2:
                 command = np.array([0, 1, 0])  # Turn Left
             else:
                 command = np.array([0, 0, 1])  # Go Straight
-            # offset from lcf -> per-step offset
+            #* 将 7 个“相对当前帧的未来位置”转换为 6 个相邻时间步增量；保存 xy 后，
+            #* gt_ego_fut_trajs 默认形状为 (6, 2)。若需要相对当前帧的累计轨迹，可沿时间维 cumsum。
             ego_fut_trajs = ego_fut_trajs[1:] - ego_fut_trajs[:-1]
 
-            ### ego lcf feat (vx, vy, ax, ay, w, length, width, vel, steer), w: yaw角速度
+            # *12. 融合 ego pose、CAN bus 和车辆尺寸，生成自车低层状态 gt_ego_lcf_feat。
+            #*==================== 自车低层状态 gt_ego_lcf_feat ====================#
+            #* VAD 将 ego pose、CAN bus 和固定车辆尺寸组合成 9 维特征：
+            #* [vx, vy, ax, ay, yaw_rate, length, width, speed, curvature]。
+            #* 其中 vx/vy、yaw_rate 由相邻 0.5 s key frame 的 ego pose 估算；ax/ay 取 can_bus[7:9]；
+            #* length/width 是本转换器定义的自车尺寸；speed/curvature 优先取 CAN bus，缺失时回退估算。
             ego_lcf_feat = np.zeros(9)
-            # 根据odom推算自车速度及加速度
+            #* 优先用上一帧计算速度与 yaw_rate；场景首帧没有 previous 时改用下一帧。
             _, _, ego_yaw = quart_to_rpy(pose_record['rotation'])
             ego_pos = np.array(pose_record['translation'])
             if pose_record_prev is not None:
@@ -490,16 +637,17 @@ def _fill_trainval_infos(nusc,
                 pose_data = pose_msgs[pose_index]
                 steer_index = locate_message(steer_uts, ref_utime)
                 steer_data = steer_msgs[steer_index]
-                # initial speed
+                #* CAN bus 的纵向速度，单位 m/s。
                 v0 = pose_data["vel"][0]  # [0] means longitudinal velocity  m/s
-                # curvature (positive: turn left)
+                #* 用转向反馈和轴距 2.588 m 近似曲率；代码约定正值表示左转。
                 steering = steer_data["value"]
-                # flip x axis if in left-hand traffic (singapore)
+                #* 新加坡为左侧通行，统一符号约定时需要翻转 steering。
                 flip_flag = True if map_location.startswith('singapore') else False
                 if flip_flag:
                     steering *= -1
                 Kappa = 2 * steering / 2.588
             except:
+                #* 当前 scene 没有可用 CAN bus 时，以前后轨迹位移估算速度，并将曲率设为 0。
                 delta_x = ego_his_trajs[-1, 0] + ego_fut_trajs[0, 0]
                 delta_y = ego_his_trajs[-1, 1] + ego_fut_trajs[0, 1]
                 v0 = np.sqrt(delta_x**2 + delta_y**2)
@@ -512,6 +660,7 @@ def _fill_trainval_infos(nusc,
             ego_lcf_feat[7] = v0
             ego_lcf_feat[8] = Kappa
 
+            # *13. 将目标检测/运动标签和自车规划标签统一写入当前帧 info。
             info['gt_boxes'] = gt_boxes
             info['gt_names'] = names
             info['gt_velocity'] = velocity.reshape(-1, 2)
@@ -525,12 +674,14 @@ def _fill_trainval_infos(nusc,
             info['gt_agent_lcf_feat'] = agent_lcf_feat.astype(np.float32)
             info['gt_agent_fut_yaw'] = gt_fut_yaw.astype(np.float32)
             info['gt_agent_fut_goal'] = gt_fut_goal.astype(np.float32)
-            info['gt_ego_his_trajs'] = ego_his_trajs[:, :2].astype(np.float32)
-            info['gt_ego_fut_trajs'] = ego_fut_trajs[:, :2].astype(np.float32)
-            info['gt_ego_fut_masks'] = ego_fut_masks[1:].astype(np.float32)
-            info['gt_ego_fut_cmd'] = command.astype(np.float32)
-            info['gt_ego_lcf_feat'] = ego_lcf_feat.astype(np.float32)
+            #* 以下字段均由 VAD 在转换阶段生成并写入元数据 pkl，而不是 nuScenes 原生字段。
+            info['gt_ego_his_trajs'] = ego_his_trajs[:, :2].astype(np.float32)  # (his_ts, 2)，历史逐步位移
+            info['gt_ego_fut_trajs'] = ego_fut_trajs[:, :2].astype(np.float32)  # (fut_ts, 2)，未来逐步位移
+            info['gt_ego_fut_masks'] = ego_fut_masks[1:].astype(np.float32)  # (fut_ts,)，去除当前时刻 mask
+            info['gt_ego_fut_cmd'] = command.astype(np.float32)  # (3,)，[右转, 左转, 直行] one-hot
+            info['gt_ego_lcf_feat'] = ego_lcf_feat.astype(np.float32)  # (9,)，自车低层运动/控制特征
 
+        # *14. 按 scene token 将完整 info 放入 train 或 val 列表，防止同一场景跨数据划分。
         if sample['scene_token'] in train_scenes:
             train_nusc_infos.append(info)
         else:
@@ -539,10 +690,12 @@ def _fill_trainval_infos(nusc,
     return train_nusc_infos, val_nusc_infos
 
 def get_global_sensor_pose(rec, nusc, inverse=False):
+    # *1. 读取指定 sample 的 LIDAR_TOP 标定和采集时刻 ego pose。
     lidar_sample_data = nusc.get('sample_data', rec['data']['LIDAR_TOP'])
 
     sd_ep = nusc.get("ego_pose", lidar_sample_data["ego_pose_token"])
     sd_cs = nusc.get("calibrated_sensor", lidar_sample_data["calibrated_sensor_token"])
+    # *2. 按需组合 global_from_ego @ ego_from_sensor，或计算其逆向变换。
     if inverse is False:
         global_from_ego = transform_matrix(sd_ep["translation"], Quaternion(sd_ep["rotation"]), inverse=False)
         ego_from_sensor = transform_matrix(sd_cs["translation"], Quaternion(sd_cs["rotation"]), inverse=False)
@@ -583,6 +736,7 @@ def obtain_sensor2top(nusc,
     Returns:
         sweep (dict): Sweep information after transformation.
     """
+    # *1. 读取来源传感器帧的文件、标定参数和采集时刻 ego pose。
     sd_rec = nusc.get('sample_data', sensor_token)
     cs_record = nusc.get('calibrated_sensor',
                          sd_rec['calibrated_sensor_token'])
@@ -590,6 +744,7 @@ def obtain_sensor2top(nusc,
     data_path = str(nusc.get_sample_data_path(sd_rec['token']))
     if os.getcwd() in data_path:  # path from lyftdataset is absolute path
         data_path = data_path.split(f'{os.getcwd()}/')[-1]  # relative path
+    # *2. 整理该相机/历史 LiDAR 帧自身的基础元数据。
     sweep = {
         'data_path': data_path,
         'type': sensor_type,
@@ -606,8 +761,8 @@ def obtain_sensor2top(nusc,
     e2g_r_s = sweep['ego2global_rotation']
     e2g_t_s = sweep['ego2global_translation']
 
-    # obtain the RT from sensor to Top LiDAR
-    # sweep->ego->global->ego'->lidar
+    # *3. 组合 sensor -> ego -> global -> 当前 ego -> 当前 LIDAR_TOP，得到统一坐标变换。
+    # *3.1 点变换约定为 points @ R.T + T，供相机标定和历史点云融合共同使用。
     l2e_r_s_mat = Quaternion(l2e_r_s).rotation_matrix
     e2g_r_s_mat = Quaternion(e2g_r_s).rotation_matrix
     R = (l2e_r_s_mat.T @ e2g_r_s_mat.T) @ (
@@ -630,7 +785,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
         version (str): Dataset version.
         mono3d (bool): Whether to export mono3d annotation. Default: False.
     """
-    # get bbox annotations for camera
+    # *1. 定义六路相机，加载前面生成的 info pkl 和 nuScenes 数据库。
     camera_types = [
         'CAM_FRONT',
         'CAM_FRONT_RIGHT',
@@ -648,6 +803,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
     ]
     coco_ann_id = 0
     coco_2d_dict = dict(annotations=[], images=[], categories=cat2Ids)
+    # *2. 遍历每帧、每个相机，将可见 3D box 投影到图像并整理为 COCO annotation。
     for info in mmcv.track_iter_progress(nusc_infos):
         for cam in camera_types:
             cam_info = info['cams'][cam]
@@ -678,6 +834,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
                 coco_info['id'] = coco_ann_id
                 coco_2d_dict['annotations'].append(coco_info)
                 coco_ann_id += 1
+    # *3. 根据是否包含单目 3D 字段确定文件名，并写出 COCO JSON。
     if mono3d:
         json_prefix = f'{info_path[:-4]}_mono3d'
     else:
@@ -702,7 +859,7 @@ def get_2d_boxes(nusc,
             `sample_data_token`.
     """
 
-    # Get the sample data and the sample corresponding to that sample data.
+    # *1. 读取相机 sample_data、所属 sample、相机标定和采集时刻 ego pose。
     sd_rec = nusc.get('sample_data', sample_data_token)
 
     assert sd_rec[
@@ -720,7 +877,7 @@ def get_2d_boxes(nusc,
     pose_rec = nusc.get('ego_pose', sd_rec['ego_pose_token'])
     camera_intrinsic = np.array(cs_rec['camera_intrinsic'])
 
-    # Get all the annotation with the specified visibilties.
+    # *2. 读取当前 sample 的 3D annotation，并按 visibility_token 过滤。
     ann_recs = [
         nusc.get('sample_annotation', token) for token in s_rec['anns']
     ]
@@ -731,6 +888,7 @@ def get_2d_boxes(nusc,
 
     repro_recs = []
 
+    # *3. 逐目标执行 global -> ego -> camera 变换，再投影到图像平面并裁剪到画布。
     for ann_rec in ann_recs:
         # Augment sample_annotation with token information.
         ann_rec['sample_annotation_token'] = ann_rec['token']
@@ -771,7 +929,7 @@ def get_2d_boxes(nusc,
         repro_rec = generate_record(ann_rec, min_x, min_y, max_x, max_y,
                                     sample_data_token, sd_rec['filename'])
 
-        # If mono3d=True, add 3D annotations in camera coordinates
+        # *4. mono3d 模式额外写入相机坐标系 3D box、速度、投影中心深度和属性类别。
         if mono3d and (repro_rec is not None):
             loc = box.center.tolist()
 
@@ -832,6 +990,7 @@ def post_process_coords(
         tuple [float]: Intersection of the convex hull of the 2D box
             corners and the image canvas.
     """
+    # *1. 由投影角点生成凸包，并与图像画布求交，去除画面外区域。
     polygon_from_2d_box = MultiPoint(corner_coords).convex_hull
     img_canvas = box(0, 0, imsize[0], imsize[1])
 
@@ -845,6 +1004,7 @@ def post_process_coords(
         max_x = max(intersection_coords[:, 0])
         max_y = max(intersection_coords[:, 1])
 
+        # *2. 用交集区域的轴对齐外接矩形作为最终 2D bbox。
         return min_x, min_y, max_x, max_y
     else:
         return None
@@ -875,6 +1035,7 @@ def generate_record(ann_rec: dict, x1: float, y1: float, x2: float, y2: float,
             - bbox (list[float]): left x, top y, dx, dy of 2d box
             - iscrowd (int): whether the area is crowd
     """
+    # *1. 保留后续可能用到的 nuScenes annotation 标识、可见性及点数等字段。
     repro_rec = OrderedDict()
     repro_rec['sample_data_token'] = sample_data_token
     coco_rec = dict()
@@ -903,6 +1064,7 @@ def generate_record(ann_rec: dict, x1: float, y1: float, x2: float, y2: float,
     coco_rec['image_id'] = sample_data_token
     coco_rec['area'] = (y2 - y1) * (x2 - x1)
 
+    # *2. 将 nuScenes 细粒度类别映射到检测类别，并生成 COCO bbox/area/category 字段。
     if repro_rec['category_name'] not in NuScenesDataset.NameMapping:
         return None
     cat_name = NuScenesDataset.NameMapping[repro_rec['category_name']]
@@ -934,6 +1096,7 @@ def nuscenes_data_prep(root_path,
         out_dir (str): Output directory of the groundtruth database info.
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
+    # *1. 当前 VAD 数据准备入口只生成 temporal info pkl；2D annotation/GT database 需另行调用。
     create_nuscenes_infos(
         root_path, out_dir, can_bus_root_path, info_prefix, version=version, max_sweeps=max_sweeps)
 
@@ -974,6 +1137,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == '__main__':
+    # *1. 完整版 nuScenes：依次为 trainval 与 test 生成独立 temporal pkl。
     if args.dataset == 'nuscenes' and args.version != 'v1.0-mini':
         train_version = f'{args.version}-trainval'
         nuscenes_data_prep(
@@ -993,6 +1157,7 @@ if __name__ == '__main__':
             dataset_name='NuScenesDataset',
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps)
+    # *2. mini 版 nuScenes：一次调用同时按官方 mini_train/mini_val 划分并写出两个 pkl。
     elif args.dataset == 'nuscenes' and args.version == 'v1.0-mini':
         train_version = f'{args.version}'
         nuscenes_data_prep(

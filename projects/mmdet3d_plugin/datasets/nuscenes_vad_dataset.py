@@ -1393,27 +1393,32 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         """
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
+        # 字段来源说明：
+        #   [nuScenes原始] 可从 nuScenes 主数据表的记录中直接取得；
+        #   [VAD整理]     基于 nuScenes 原始记录收集、变换或重新组织得到；
+        #   [VAD生成]     VAD 为时序感知/运动规划任务额外计算的标签或特征。
         input_dict = dict(
-            sample_idx=info['token'],
-            pts_filename=info['lidar_path'].replace("./data/nuscenes", self.data_root.rstrip("/"), 1),
-            sweeps=info['sweeps'],
-            ego2global_translation=info['ego2global_translation'],
-            ego2global_rotation=info['ego2global_rotation'],
-            lidar2ego_translation=info['lidar2ego_translation'],
-            lidar2ego_rotation=info['lidar2ego_rotation'],
-            prev_idx=info['prev'],
-            next_idx=info['next'],
-            scene_token=info['scene_token'],
-            can_bus=info['can_bus'], # (18,)
-            frame_idx=info['frame_idx'],
-            timestamp=info['timestamp'] / 1e6,
-            fut_valid_flag=info['fut_valid_flag'], # bool,true
-            map_location=info['map_location'], # str,eg.:'singapore-onenorth'
-            ego_his_trajs=info['gt_ego_his_trajs'], # (2,2)
-            ego_fut_trajs=info['gt_ego_fut_trajs'], # (6,2)
-            ego_fut_masks=info['gt_ego_fut_masks'], # (6,)
-            ego_fut_cmd=info['gt_ego_fut_cmd'], # (3,)
-            ego_lcf_feat=info['gt_ego_lcf_feat'] # (9,)
+            sample_idx=info['token'],  # [nuScenes原始] 当前 key frame 的 sample token（全局唯一字符串）
+            pts_filename=info['lidar_path'].replace(  # [VAD整理] nuScenes 点云路径替换为当前实际 data_root
+                "./data/nuscenes", self.data_root.rstrip("/"), 1),
+            sweeps=info['sweeps'],  # [VAD整理] 沿 sample_data.prev 收集历史 LiDAR，并计算到当前帧的变换
+            ego2global_translation=info['ego2global_translation'],  # [nuScenes原始] ego_pose 平移 [x,y,z]，m
+            ego2global_rotation=info['ego2global_rotation'],  # [nuScenes原始] ego_pose 四元数 [w,x,y,z]
+            lidar2ego_translation=info['lidar2ego_translation'],  # [nuScenes原始] calibrated_sensor 平移 [x,y,z]，m
+            lidar2ego_rotation=info['lidar2ego_rotation'],  # [nuScenes原始] calibrated_sensor 四元数 [w,x,y,z]
+            prev_idx=info['prev'],  # [nuScenes原始] 上一 key frame 的 sample token；场景首帧为 ''
+            next_idx=info['next'],  # [nuScenes原始] 下一 key frame 的 sample token；场景末帧为 ''
+            scene_token=info['scene_token'],  # [nuScenes原始] 所属 scene 的 token，不是 scene-xxxx 名称
+            can_bus=info['can_bus'],  # [VAD整理] 官方 CAN bus expansion 的 pose 消息被打包为 (18,) 特征
+            frame_idx=info['frame_idx'],  # [VAD生成] 当前 key frame 在场景内的顺序编号，从 0 开始
+            timestamp=info['timestamp'] / 1e6,  # [VAD整理] nuScenes 原始微秒时间戳转换为秒
+            fut_valid_flag=info['fut_valid_flag'],  # [VAD生成] bool，之后是否有完整 6 个 future key frame
+            map_location=info['map_location'],  # [VAD整理] 从 scene 对应的 log.location 取得，如 singapore-onenorth
+            ego_his_trajs=info['gt_ego_his_trajs'],  # [VAD生成] (2,2)，LiDAR 系下过去 2 步增量 (dx,dy)，m
+            ego_fut_trajs=info['gt_ego_fut_trajs'],  # [VAD生成] (6,2)，LiDAR 系下未来 6 步增量 (dx,dy)，m
+            ego_fut_masks=info['gt_ego_fut_masks'],  # [VAD生成] (6,)，未来各步有效掩码：1 有效、0 无效
+            ego_fut_cmd=info['gt_ego_fut_cmd'],  # [VAD生成] (3,) 轨迹派生 one-hot：[右转,左转,直行]
+            ego_lcf_feat=info['gt_ego_lcf_feat']  # [VAD生成] (9,) [vx,vy,ax,ay,yaw_rate,L,W,speed,curvature]
         )
         # lidar to ego transform
         lidar2ego = np.eye(4).astype(np.float32)
