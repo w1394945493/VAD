@@ -1046,7 +1046,7 @@ class VADHead(DETRHead):
         # A：agent 数；V/P：地图实例数/每个实例的点数；M/Me：agent/ego 轨迹模态数；
         # T：未来时间步数；D：特征维度；Ca/Cm：agent/map 类别数。
         outs = {
-            'bev_embed': bev_embed,  # 时空融合后的 BEV 特征，[bev_h*bev_w, B, D]
+            'bev_embed': bev_embed,  # (10000 1 256) # 时空融合后的 BEV 特征，[bev_h*bev_w, B, D]
             'all_cls_scores': outputs_classes,  # 各层 agent 类别 logits，[Ld, B, A, Ca]
             'all_bbox_preds': outputs_coords,  # 各层 agent 3D 框编码，[Ld, B, A, code_size]，默认 code_size=10
             'all_traj_preds': outputs_trajs.repeat(  # agent 多模态未来二维位移，[Ld, B, A, M, T*2]
