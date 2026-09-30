@@ -1,4 +1,19 @@
 """初始化 VAD 推理所需的数据和模型，后续用于保存感知、预测结果。"""
+import os
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# 需要放在可能导入 transformers 的模块之前。
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+
+warnings.filterwarnings(
+    'ignore',
+    message=r'On January 1, 2023, MMCV will release v2\.0\.0.*'
+)
+warnings.filterwarnings(
+    'ignore',
+    message=r'The arguments `.*` in BaseTransformerLayer has been deprecated.*'
+)
 
 import argparse
 import copy
@@ -12,8 +27,7 @@ from mmcv.runner import load_checkpoint
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning)
+
 # 保证从任意目录执行脚本时都能导入 projects.mmdet3d_plugin。
 sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
 
