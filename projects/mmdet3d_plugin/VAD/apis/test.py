@@ -64,7 +64,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     have_mask = False
     for i, data in enumerate(data_loader):
         with torch.no_grad():
+            # =============================================#
+            # 单次前向传播
             result = model(return_loss=False, rescale=True, **data)
+            
+            # =============================================#
             # encode mask results
             if isinstance(result, dict):
                 if 'bbox_results' in result.keys():

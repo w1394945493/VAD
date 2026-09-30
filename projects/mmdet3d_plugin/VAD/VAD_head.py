@@ -1047,21 +1047,21 @@ class VADHead(DETRHead):
         # T：未来时间步数；D：特征维度；Ca/Cm：agent/map 类别数。
         outs = {
             'bev_embed': bev_embed,  # (10000 1 256) # 时空融合后的 BEV 特征，[bev_h*bev_w, B, D]
-            'all_cls_scores': outputs_classes,  # 各层 agent 类别 logits，[Ld, B, A, Ca]
-            'all_bbox_preds': outputs_coords,  # 各层 agent 3D 框编码，[Ld, B, A, code_size]，默认 code_size=10
-            'all_traj_preds': outputs_trajs.repeat(  # agent 多模态未来二维位移，[Ld, B, A, M, T*2]
-                outputs_coords.shape[0], 1, 1, 1, 1),  # 运动分支仅预测一次，此处复制 Ld 份以计算逐层 loss
-            'all_traj_cls_scores': outputs_trajs_classes.repeat(  # agent 轨迹模态 logits，[Ld, B, A, M]
-                outputs_coords.shape[0], 1, 1, 1),  # 同样复制 Ld 份以适配各检测 decoder 层
-            'map_all_cls_scores': map_outputs_classes,  # 各层地图实例类别 logits，[Lm, B, V, Cm]
-            'map_all_bbox_preds': map_outputs_coords,  # 各层地图实例包围框 (cx,cy,w,h)，[Lm, B, V, 4]
-            'map_all_pts_preds': map_outputs_pts_coords,  # 各层地图实例有序矢量点，[Lm, B, V, P, 2]
+            'all_cls_scores': outputs_classes,  # (3 1 300 10) 各层 agent 类别 logits，[Ld, B, A, Ca]
+            'all_bbox_preds': outputs_coords,  # (3 1 300 10) 各层 agent 3D 框编码，[Ld, B, A, code_size]，默认 code_size=10
+            'all_traj_preds': outputs_trajs.repeat(     # agent 多模态未来二维位移，[Ld, B, A, M, T*2]
+                outputs_coords.shape[0], 1, 1, 1, 1),   # (3 1 300 6 12) 运动分支仅预测一次，此处复制 Ld 份以计算逐层 loss
+            'all_traj_cls_scores': outputs_trajs_classes.repeat(    #  agent 轨迹模态 logits，[Ld, B, A, M]
+                outputs_coords.shape[0], 1, 1, 1),                  # (3 1 300 6) 同样复制 Ld 份以适配各检测 decoder 层
+            'map_all_cls_scores': map_outputs_classes,  # (3 1 100 3) 各层地图实例类别 logits，[Lm, B, V, Cm]
+            'map_all_bbox_preds': map_outputs_coords,  # (3 1 100 4) 各层地图实例包围框 (cx,cy,w,h)，[Lm, B, V, 4]
+            'map_all_pts_preds': map_outputs_pts_coords,  # (3 1 100 20 2) 各层地图实例有序矢量点，[Lm, B, V, P, 2]
             'enc_cls_scores': None,  # agent encoder proposal 类别预测；当前实现未返回
             'enc_bbox_preds': None,  # agent encoder proposal 框预测；当前实现未返回
             'map_enc_cls_scores': None,  # map encoder proposal 类别预测；当前实现未返回
             'map_enc_bbox_preds': None,  # map encoder proposal 包围框预测；当前实现未返回
             'map_enc_pts_preds': None,  # map encoder proposal 矢量点预测；当前实现未返回
-            'ego_fut_preds': outputs_ego_trajs,  # 不同驾驶指令下的自车未来二维位移，[B, Me, T, 2]
+            'ego_fut_preds': outputs_ego_trajs,  # (1 3 6 2) 不同驾驶指令下的自车未来二维位移，[B, Me, T, 2]
         }
 
         return outs
