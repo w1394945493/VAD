@@ -338,14 +338,14 @@ class VAD(MVXTwoStageDetector):
         **kwargs
     ):
         """Test function without augmentaiton."""
-        img_feats = self.extract_feat(img=img, img_metas=img_metas) # (1 6 256 12 20)
+        img_feats = self.extract_feat(img=img, img_metas=img_metas) # 4:(1 6 256 96 160) (1 6 256 46 80) (1 6 256 23 40) (1 6 256 12 20) img:(1 6 3 736 1280)
         bbox_list = [dict() for i in range(len(img_metas))]
         new_prev_bev, bbox_pts, metric_dict = self.simple_test_pts(
             img_feats,
             img_metas,
             gt_bboxes_3d,
             gt_labels_3d,
-            prev_bev,
+            prev_bev, # (40000 1 256)
             map_gt_bboxes_3d=map_gt_bboxes_3d,
             map_gt_labels_3d=map_gt_labels_3d,
             fut_valid_flag=fut_valid_flag,
