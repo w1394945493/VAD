@@ -289,7 +289,7 @@ def main():
     N = 10
     SCORE_THR = 0.3
     MAP_THR = 0.3
-    VIS_ROOT = 'out/pred_vis'
+    VIS_ROOT = 'out/vad_pred_vis'
     os.makedirs(osp.join(VIS_ROOT, 'train'), exist_ok=True)
     os.makedirs(osp.join(VIS_ROOT, 'val'), exist_ok=True)
 
