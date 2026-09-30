@@ -239,7 +239,7 @@ def parse_args():
 def main():
     args = parse_args()
     # 可视化已移到本脚本，避免模型内部重复绘图。
-    os.environ.pop('VAD_DEBUG_VIS_DIR', None)
+    # os.environ.pop('VAD_DEBUG_VIS_DIR', None)
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
