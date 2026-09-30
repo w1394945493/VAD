@@ -12,6 +12,7 @@ import copy
 import importlib
 import os.path as osp
 import sys
+import torch
 
 from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
@@ -24,6 +25,35 @@ from mmdet3d.models import build_model
 sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
 
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
+
+
+def print_metrics(split, metrics):
+    """按 VAD 的数据集评测公式汇总前 N 帧指标。"""
+    def value(x):
+        return float(x.item()) if hasattr(x, 'item') else float(x)
+
+    total = {}
+    for metric in metrics:
+        for key, val in metric.items():
+            total[key] = total.get(key, 0.0) + value(val)
+
+    def divide(a, b):
+        return a / b if b else float('nan')
+
+    print(f'\n-------------- {split} Motion Prediction --------------')
+    for cls in ['car', 'pedestrian']:
+        print(
+            f'{cls}: '
+            f'EPA={divide(total["hit_"+cls] - 0.5 * total["fp_"+cls], total["gt_"+cls]):.4f}, '
+            f'ADE={divide(total["ADE_"+cls], total["cnt_ade_"+cls]):.4f}, '
+            f'FDE={divide(total["FDE_"+cls], total["cnt_fde_"+cls]):.4f}, '
+            f'MR={divide(total["MR_"+cls], total["cnt_fde_"+cls]):.4f}')
+
+    valid_num = sum(value(metric['fut_valid_flag']) for metric in metrics)
+    print(f'-------------- {split} Planning ({int(valid_num)} valid) --------------')
+    for key in metrics[0]:
+        if key.startswith('plan_'):
+            print(f'{key}: {divide(total[key], valid_num):.4f}')
 
 
 def parse_args():
@@ -82,7 +112,34 @@ def main():
 
     print(f'训练集：{len(train_dataset)} 帧，{len(train_loader)} 个 batch')
     print(f'验证集：{len(val_dataset)} 帧，{len(val_loader)} 个 batch')
-    print('模型与权重加载完成；当前脚本尚未执行推理。')
+    print('模型与权重加载完成。')
+
+    # 调试阶段只跑前 N 帧；保持数据顺序，以正确复用同一场景的历史 BEV。
+    N = 10
+
+    train_metrics = []
+    model.module.prev_frame_info['scene_token'] = None
+    model.module.prev_frame_info['prev_bev'] = None
+    for i, data in enumerate(train_loader):
+        with torch.no_grad():
+            result = model(return_loss=False, rescale=True, **data)
+        train_metrics.append(result[0]['metric_results'])
+        print(f'\rtrain: {i + 1}/{min(N, len(train_loader))}', end='', flush=True)
+        if i + 1 >= N:
+            break
+    print_metrics('Train', train_metrics)
+
+    val_metrics = []
+    model.module.prev_frame_info['scene_token'] = None
+    model.module.prev_frame_info['prev_bev'] = None
+    for i, data in enumerate(val_loader):
+        with torch.no_grad():
+            result = model(return_loss=False, rescale=True, **data)
+        val_metrics.append(result[0]['metric_results'])
+        print(f'\rval: {i + 1}/{min(N, len(val_loader))}', end='', flush=True)
+        if i + 1 >= N:
+            break
+    print_metrics('Val', val_metrics)
 
 
 if __name__ == '__main__':
