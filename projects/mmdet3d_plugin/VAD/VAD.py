@@ -318,6 +318,58 @@ class VAD(MVXTwoStageDetector):
 
         return bbox_results
 
+        '''
+        bbox_results = [
+            {
+                'pts_bbox': {
+                    # ------------------------------------------
+                    # 周围目标检测与运动预测
+                    'boxes_3d': LiDARInstance3DBoxes,  # N 个目标，内部 tensor 通常为 [N, 9] N：预测出的周围目标数量
+                    'scores_3d': Tensor[N],            # 目标检测置信度
+                    'labels_3d': Tensor[N],            # 目标类别 ID
+                    'trajs_3d': Tensor[N, M, T*2],     # 目标的多模态未来增量轨迹 M：每个目标的轨迹模态数
+
+                    # ------------------------------------------
+                    # 地图实例预测
+                    'map_boxes_3d': Tensor[Nmap, ...], # 地图实例包围框 Nmap：预测地图实例数量
+                    'map_scores_3d': Tensor[Nmap],     # 地图实例置信度
+                    'map_labels_3d': Tensor[Nmap],     # 地图实例类别 ID
+                    'map_pts_3d': Tensor[Nmap, P, 2],  # 地图实例的 P 个二维折线点 P：每个地图实例的采样点数
+
+                    # 自车规划预测
+                    'ego_fut_preds': Tensor[Me, T, 2], # 不同驾驶指令下的自车未来增量轨迹 Me：自车驾驶指令数量，通常是3
+                    'ego_fut_cmd': Tensor[..., Me],    # 自车驾驶指令，通常为 one-hot
+                },
+
+                'metric_results': {
+                    # 周围目标运动预测指标的单帧累计量
+                    'gt_car': ...,
+                    'cnt_ade_car': ...,
+                    'cnt_fde_car': ...,
+                    'hit_car': ...,
+                    'fp_car': ...,
+                    'ADE_car': ...,
+                    'FDE_car': ...,
+                    'MR_car': ...,
+
+                    'gt_pedestrian': ...,
+                    'cnt_ade_pedestrian': ...,
+                    # ...
+
+                    # 自车规划指标
+                    'plan_L2_1s': ...,
+                    'plan_L2_2s': ...,
+                    'plan_L2_3s': ...,
+                    'plan_obj_col_1s': ...,
+                    'plan_obj_col_2s': ...,
+                    'plan_obj_col_3s': ...,
+                    'plan_obj_box_col_1s': ...,
+                    # ...
+                }
+            }
+        ]
+        '''
+
     def simple_test(
         self,
         img_metas,
@@ -480,16 +532,17 @@ class VAD(MVXTwoStageDetector):
                     #*-----------------------------------------------------#
                     #* 4. 提取未经评测阈值过滤的预测结果
                     # 包括目标框/类别/轨迹、地图实例及自车规划结果。
-                    boxes = to_numpy(vis_bbox_result['boxes_3d'].tensor)
-                    scores = to_numpy(vis_bbox_result['scores_3d'])
-                    labels = to_numpy(vis_bbox_result['labels_3d']).astype(np.int64)
-                    trajs = to_numpy(vis_bbox_result['trajs_3d'])
-                    map_scores = to_numpy(vis_bbox_result['map_scores_3d'])
-                    map_labels = to_numpy(
-                        vis_bbox_result['map_labels_3d']).astype(np.int64)
-                    map_pts = to_numpy(vis_bbox_result['map_pts_3d'])
-                    ego_preds_np = to_numpy(vis_bbox_result['ego_fut_preds'])
-                    ego_cmd_np = to_numpy(vis_bbox_result['ego_fut_cmd'])
+                    # N/Nmap：目标/地图实例数；M/Me：目标轨迹/自车指令模态数。
+                    # T：未来步数；P：地图采样点数；当前通常 M=6、Me=3、T=6、P=20。
+                    boxes = to_numpy(vis_bbox_result['boxes_3d'].tensor)  # [N,9]：解码后的目标框，依次为 x,y,z,w,l,h,yaw,vx,vy。
+                    scores = to_numpy(vis_bbox_result['scores_3d'])  # [N]：各目标的分类置信度，用于阈值过滤。
+                    labels = to_numpy(vis_bbox_result['labels_3d']).astype(np.int64)  # [N]：目标类别 ID，用于索引 mapped_class_names。
+                    trajs = to_numpy(vis_bbox_result['trajs_3d'])  # [N,M,T*2]：各目标 M 种未来逐步位移 (dx,dy)，通常 [N,6,12]。
+                    map_scores = to_numpy(vis_bbox_result['map_scores_3d'])  # [Nmap]：各地图实例置信度，用于地图阈值过滤。
+                    map_labels = to_numpy(vis_bbox_result['map_labels_3d']).astype(np.int64)  # [Nmap]：地图类别 ID，对应 divider/crossing/boundary。
+                    map_pts = to_numpy(vis_bbox_result['map_pts_3d'])  # [Nmap,P,2]：各地图实例按顺序采样的 P 个 BEV 折线点 (x,y)。
+                    ego_preds_np = to_numpy(vis_bbox_result['ego_fut_preds'])  # [Me,T,2]：各驾驶指令槽位的自车未来逐步位移，通常 [3,6,2]。
+                    ego_cmd_np = to_numpy(vis_bbox_result['ego_fut_cmd'])  # [1,1,1,Me]：右转/左转/直行 one-hot 指令，squeeze 后 [Me]。
 
                     # 同名 NPZ 保存纯数组，可复制到无 mmdet3d 的机器离线重画。
                     # np.savez_compressed(
@@ -504,17 +557,11 @@ class VAD(MVXTwoStageDetector):
                     #* 5. 创建画布并绘制六路环视原图
                     # 紧凑布局：左侧 2x3 环视，中间预测，右侧 GT。
                     fig = plt.figure(figsize=(16, 4.8))
-                    outer_grid = fig.add_gridspec(
-                        1, 3, width_ratios=[5.4, 1, 1],
-                        wspace=0.04)
-                    camera_grid = outer_grid[0].subgridspec(
-                        2, 3, wspace=0.01, hspace=0.01)
-                    camera_axes = [
-                        fig.add_subplot(camera_grid[row, col])
-                        for row in range(2) for col in range(3)]
+                    outer_grid = fig.add_gridspec(1, 3, width_ratios=[5.4, 1, 1],wspace=0.04)
+                    camera_grid = outer_grid[0].subgridspec(2, 3, wspace=0.01, hspace=0.01)
+                    camera_axes = [fig.add_subplot(camera_grid[row, col]) for row in range(2) for col in range(3)]
                     ax = fig.add_subplot(outer_grid[1])
-                    gt_ax = fig.add_subplot(
-                        outer_grid[2], sharex=ax, sharey=ax)
+                    gt_ax = fig.add_subplot(outer_grid[2], sharex=ax, sharey=ax)
 
                     # filename 的原始顺序为 FRONT、FRONT_RIGHT、FRONT_LEFT、
                     # BACK、BACK_LEFT、BACK_RIGHT；这里调整为更直观的环视布局。
@@ -523,10 +570,8 @@ class VAD(MVXTwoStageDetector):
                         'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
                     camera_order = [2, 0, 1, 4, 3, 5]
                     image_paths = img_metas[0]['filename']
-                    for camera_ax, camera_name, camera_index in zip(
-                            camera_axes, camera_names, camera_order):
-                        camera_ax.imshow(
-                            plt.imread(image_paths[camera_index]))
+                    for camera_ax, camera_name, camera_index in zip(camera_axes, camera_names, camera_order):
+                        camera_ax.imshow(plt.imread(image_paths[camera_index]))
                         # 相机名叠加在图像内部，避免标题额外占用纵向空间。
                         camera_ax.text(
                             0.01, 0.97, camera_name,
@@ -549,14 +594,11 @@ class VAD(MVXTwoStageDetector):
                         pts = np.asarray(pts).reshape(-1, 2)
                         color = pred_map_colors[
                             int(label) % len(pred_map_colors)]
-                        ax.plot(pts[:, 0], pts[:, 1], color=color,
-                                linewidth=1, alpha=0.8, zorder=1)
-                        ax.scatter(pts[:, 0], pts[:, 1], color=color,
-                                   s=2, alpha=0.8, zorder=1)
+                        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1, alpha=0.8, zorder=1)
+                        ax.scatter(pts[:, 0], pts[:, 1], color=color, s=2, alpha=0.8, zorder=1)
 
                     # 绘制目标 BEV 框、类别/分数及全部未来轨迹模态。
-                    for box, score, label, obj_trajs in zip(
-                            boxes, scores, labels, trajs):
+                    for box, score, label, obj_trajs in zip(boxes, scores, labels, trajs):
                         if score < vis_score_threshold:
                             continue
                         x, y, width, length, yaw = (
@@ -751,6 +793,7 @@ class VAD(MVXTwoStageDetector):
             matched_bbox_result = self.assign_pred_to_gt_vip3d(  # 将预测目标匹配至真值。
                 bbox_result, gt_bbox, gt_label)  # 输入过滤后的预测、真值框和类别。
 
+            #* 计算周围目标轨迹预测指标
             metric_dict = self.compute_motion_metric_vip3d(  # 计算目标运动预测指标。
                 gt_bbox, gt_label, gt_attr_label, bbox_result,
                 matched_bbox_result, mapped_class_names)  # 使用匹配关系和类别映射。
@@ -858,22 +901,30 @@ class VAD(MVXTwoStageDetector):
         mapped_class_names,
         match_dis_thresh=2.0,
     ):
-        """Compute EPA metric for one sample.
+        """计算单帧周围目标的 VIP3D 运动预测指标累计量（不评估自车）。
+
+        评测对象是周围车辆和行人：先统计未匹配预测 FP，再对已匹配目标
+        计算 best-of-M ADE/FDE，并按终点误差阈值统计 hit 和 miss。
+        自车规划轨迹由 compute_planner_metric_stp3() 单独评测。
+
         Args:
-            gt_bboxs (LiDARInstance3DBoxes): GT Bboxs.
-            gt_label (Tensor): GT labels for gt_bbox, [num_gt_bbox].
-            pred_bbox (dict): Predictions.
-                'boxes_3d': (LiDARInstance3DBoxes)
-                'scores_3d': (Tensor), [num_pred_bbox]
-                'labels_3d': (Tensor), [num_pred_bbox]
-                'trajs_3d': (Tensor), [fut_ts*2]
-            matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
-            match_dis_thresh (float): dis thresh for determine a positive sample for a gt bbox.
+            gt_bbox: GT 3D 框，数量为 Ng。
+            gt_label: GT 类别，形状 [Ng]。
+            gt_attr_label: GT 未来位移、有效 mask 等属性，形状 [Ng, D]。
+            pred_bbox: 预测框、类别和多模态未来轨迹组成的字典。
+            matched_bbox_result: 每个 GT 对应的预测索引，[Ng]；-1 表示未匹配。
+            mapped_class_names: 类别 ID 到类别名称的映射。
+            match_dis_thresh: FDE 命中阈值，默认 2 米。
 
         Returns:
-            EPA_dict (dict): EPA metric dict of each cared class.
+            dict: car/pedestrian 的 GT、FP、hit、ADE、FDE、MR 等单帧累计量。
         """
+        #*-----------------------------------------------------#
+        #* 1. 初始化需要评估的类别及各项单帧累计量
+        # 这里只评估周围车辆和行人；不包含自车，最终指标在数据集汇总阶段计算。
         motion_cls_names = ['car', 'pedestrian']
+        # gt：完整 GT 数；cnt_ade/cnt_fde：ADE/FDE 分母；hit/fp：EPA 所需计数；
+        # ADE/FDE：误差之和；MR：终点未命中数。以上均按 car/pedestrian 分开累计。
         motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
                                'fp', 'ADE', 'FDE', 'MR']
 
@@ -882,6 +933,9 @@ class VAD(MVXTwoStageDetector):
             for cls in motion_cls_names:
                 metric_dict[met+'_'+cls] = 0.0
 
+        #*-----------------------------------------------------#
+        #* 2. 合并车辆类别，并统计没有匹配到 GT 的预测为 FP
+        # car/truck/bus/trailer 统一按 car 评估，其他指定类别直接忽略。
         veh_list = [0,1,3,4]
         ignore_list = ['construction_vehicle', 'barrier',
                        'traffic_cone', 'motorcycle', 'bicycle']
@@ -892,43 +946,73 @@ class VAD(MVXTwoStageDetector):
             if box_name in ignore_list:
                 continue
             if i not in matched_bbox_result:
+                # FP：未匹配到任何 GT 的周围目标预测；最终以 0.5 权重惩罚 EPA。
                 metric_dict['fp_'+box_name] += 1
 
+        #*-----------------------------------------------------#
+        #* 3. 遍历 GT，读取未来轨迹有效 mask 并检查是否存在匹配预测
         for i in range(gt_label.shape[0]):
             gt_label[i] = 0 if gt_label[i] in veh_list else gt_label[i]
             box_name = mapped_class_names[gt_label[i]]
             if box_name in ignore_list:
                 continue
+            # GT 属性前 T*2 维是逐步位移，随后 T 维是未来时间步有效 mask。
             gt_fut_masks = gt_attr_label[i][self.fut_ts*2:self.fut_ts*3]
             num_valid_ts = sum(gt_fut_masks==1)
             if num_valid_ts == self.fut_ts:
+                # gt：具有完整 T 步未来标注的周围目标数，作为 EPA 的分母。
                 metric_dict['gt_'+box_name] += 1
+            # 只有已匹配且至少有一个有效未来时间步的 GT 才计算轨迹误差。
             if matched_bbox_result[i] >= 0 and num_valid_ts > 0:
+                # cnt_ade：可计算 ADE 的匹配目标数，作为数据集平均 ADE 的分母。
                 metric_dict['cnt_ade_'+box_name] += 1
                 m_pred_idx = matched_bbox_result[i]
+                #*-----------------------------------------------------#
+                #* 4. 恢复 GT 与预测的未来轨迹，并转换为绝对 BEV 坐标
                 gt_fut_trajs = gt_attr_label[i][:self.fut_ts*2].reshape(-1, 2)
                 gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
                 pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
                 pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
+                # 网络和 GT 保存的是逐步位移，通过累加得到相对当前位置的轨迹点。
                 gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
                 pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
+                # 分别加上当前 GT/预测框中心，得到同一 BEV 坐标系下的绝对轨迹。
                 gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]
                 pred_fut_trajs = pred_fut_trajs + pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
 
+                #*-----------------------------------------------------#
+                #* 5. 计算所有轨迹模态到 GT 的逐时间步 L2 距离(欧式距离)
                 dist = torch.linalg.norm(gt_fut_trajs[None, :, :] - pred_fut_trajs, dim=-1)
+                # 每个模态先求平均位移误差，再选择误差最小的模态作为 minADE。
                 ade = dist.sum(-1) / num_valid_ts
                 ade = ade.min()
-
+                # 自动驾驶需要看清周边交通参与者，还需要预测他们在未来数秒内的运动轨迹
+                # ADE：平均位移误差 FDE：最终位移误差
+                # ADE：评估模型对车辆行驶路径整体趋势的“跟踪精度”，越低越好；ADE敏感于轨迹平滑性与动态建模能力；
+                # FDE：预测轨迹的最后一个时间步与真实轨迹最后一个时间步之间的欧式距离 FDE则直指决策关键点（如变道终点是否侵入邻道）
+                # 实际道路场景中，人类驾驶意图具有天生的多模态性，模型只预测一种可能，必然会漏掉其他潜在的风险。主流的AI轨迹预测网络会输出K条可能的预测轨迹
+                # ADE：有效未来时间步上的平均位移误差；累加后除以 cnt_ade 得到平均 ADE，越小越好。
                 metric_dict['ADE_'+box_name] += ade
+                #*-----------------------------------------------------#
+                #* 6. 未来 T 步全部有效时，计算 minFDE、Hit 和 Miss Rate
                 if num_valid_ts == self.fut_ts:
-                    fde = dist[:, -1].min()
+                    # 从所有模态中选择终点误差最小者作为 minFDE。
+                    fde = dist[:, -1].min() #* 用于计算minFDE
+                    # cnt_fde：具有完整未来轨迹且成功匹配的目标数，作为平均 FDE/命中率的统计分母。
                     metric_dict['cnt_fde_'+box_name] += 1
+                    # FDE：预测轨迹终点与 GT 终点的距离；累加后除以 cnt_fde 得到平均 FDE，越小越好。
                     metric_dict['FDE_'+box_name] += fde
+                    # minFDE 不超过阈值记为 hit，否则记为 miss。
                     if fde <= match_dis_thresh:
+                        # Hit：minFDE <= 距离阈值的命中数，用于衡量至少一个预测模态能否准确到达终点。
                         metric_dict['hit_'+box_name] += 1
                     else:
+                        # MR：minFDE > 距离阈值的漏预测数；汇总后除以 cnt_fde 得到 Miss Rate，越小越好。
                         metric_dict['MR_'+box_name] += 1
 
+        # 返回周围目标的单帧累计量；跨帧求和后计算：
+        # EPA=(hit-0.5*fp)/gt，ADE=ADE之和/cnt_ade，
+        # FDE=FDE之和/cnt_fde，MR=miss数/cnt_fde。
         return metric_dict
 
     ### same planning metric as stp3
