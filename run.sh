@@ -11,3 +11,6 @@ python /vepfs-mlp2/c20250502/haoce/wangyushen/VAD/tools/test.py \
 python tools/analysis_tools/visualization.py \
     --result-path /path/to/inference/results \
     --save-path /path/to/save/visualization/results
+
+python /home/wys/wsl/forks/VAD/scripts/create_scene_videos.py \
+    --input-dir 
