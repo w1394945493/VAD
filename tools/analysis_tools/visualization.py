@@ -1,5 +1,18 @@
 import sys
 sys.path.append('')
+
+"""VAD 推理结果可视化脚本。
+
+整体流程：
+1. 从 pkl 文件中读取检测、地图和自车规划预测；
+2. 针对每个 nuScenes sample 生成一张鸟瞰图（BEV）；
+3. 读取同一时刻的六路相机图像，并把预测框变换到各相机坐标系；
+4. 在前视相机中额外绘制自车规划轨迹；
+5. 将六路相机图和 BEV 图拼接，逐帧写入 vis.mp4。
+
+检测框最初位于 nuScenes 全局坐标系，绘制时会按需转换到 LiDAR 或相机
+坐标系。预测轨迹通常保存为逐时间步位移，绘图前需要累加。
+"""
 import os
 import argparse
 import os.path as osp
@@ -26,6 +39,7 @@ from projects.mmdet3d_plugin.core.bbox.structures.nuscenes_box import CustomNusc
 from projects.mmdet3d_plugin.datasets.nuscenes_vad_dataset import VectorizedLocalMap, LiDARInstanceLines
 
 
+# nuScenes 标准六相机名称；部分单帧调试函数会使用。
 cams = ['CAM_FRONT',
  'CAM_FRONT_RIGHT',
  'CAM_BACK_RIGHT',
@@ -42,7 +56,9 @@ def render_annotation(
         out_path: str = 'render.png',
         extra_info: bool = False) -> None:
     """
-    Render selected annotation.
+    同时在 LiDAR 鸟瞰图和可见相机中绘制一个指定的 GT 标注。
+
+    这是单目标调试工具，并非文件末尾批量生成视频的主流程。
     :param anntoken: Sample_annotation token.
     :param margin: How many meters in each direction to include in LIDAR view.
     :param view: LIDAR view point.
@@ -50,11 +66,12 @@ def render_annotation(
     :param out_path: Optional path to save the rendered figure to disk.
     :param extra_info: Whether to render extra information below camera view.
     """
+    # 由 annotation 找到所属 sample 和该帧的全部传感器数据。
     ann_record = nusc.get('sample_annotation', anntoken)
     sample_record = nusc.get('sample', ann_record['sample_token'])
     assert 'LIDAR_TOP' in sample_record['data'].keys(), 'Error: No LIDAR_TOP in data, unable to render.'
 
-    # Figure out which camera the object is fully visible in (this may return nothing).
+    # 遍历六路相机，找出能够看到该目标的相机。
     boxes, cam = [], []
     cams = [key for key in sample_record['data'].keys() if 'CAM' in key]
     all_bboxes = []
@@ -75,7 +92,7 @@ def render_annotation(
     fig, axes = plt.subplots(1, num_cam + 1, figsize=(18, 9))
     select_cams = [sample_record['data'][cam] for cam in select_cams]
     print('bbox in cams:', select_cams)
-    # Plot LIDAR view.
+    # 左侧子图：在 LIDAR_TOP 坐标系下绘制点云和 3D 框。
     lidar = sample_record['data']['LIDAR_TOP']
     data_path, boxes, camera_intrinsic = nusc.get_sample_data(lidar, selected_anntokens=[anntoken])
     LidarPointCloud.from_file(data_path).render_height(axes[0], view=view)
@@ -88,7 +105,7 @@ def render_annotation(
         axes[0].axis('off')
         axes[0].set_aspect('equal')
 
-    # Plot CAMERA view.
+    # 其余子图：把同一个 3D 框投影到每个可见相机平面。
     for i in range(1, num_cam + 1):
         cam = select_cams[i - 1]
         data_path, boxes, camera_intrinsic = nusc.get_sample_data(cam, selected_anntokens=[anntoken])
@@ -105,6 +122,7 @@ def render_annotation(
         axes[i].set_xlim(0, im.size[0])
         axes[i].set_ylim(im.size[1], 0)
 
+    # 可选：显示类别、点数、距离和目标尺寸等 GT 信息。
     if extra_info:
         rcParams['font.family'] = 'monospace'
 
@@ -139,8 +157,9 @@ def get_sample_data(sample_data_token: str,
                     selected_anntokens=None,
                     use_flat_vehicle_coordinates: bool = False):
     """
-    Returns the data path as well as all annotations related to that sample_data.
-    Note that the boxes are transformed into the current sensor's coordinate frame.
+    读取传感器数据及其 GT 框，并将框从全局坐标系变换到传感器坐标系。
+
+    坐标变换链为 global -> ego -> sensor。
     :param sample_data_token: Sample_data token.
     :param box_vis_level: If sample_data is an image, this sets required visibility for boxes.
     :param selected_anntokens: If provided only return the selected annotation.
@@ -149,7 +168,7 @@ def get_sample_data(sample_data_token: str,
     :return: (data_path, boxes, camera_intrinsic <np.array: 3, 3>)
     """
 
-    # Retrieve sensor & pose records
+    # 标定记录描述 sensor -> ego，位姿记录描述 ego -> global。
     sd_record = nusc.get('sample_data', sample_data_token)
     cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
     sensor_record = nusc.get('sensor', cs_record['sensor_token'])
@@ -164,13 +183,13 @@ def get_sample_data(sample_data_token: str,
         cam_intrinsic = None
         imsize = None
 
-    # Retrieve all sample annotations and map to sensor coordinate system.
+    # 获取指定标注，或获取当前 sample_data 对应的全部 GT 框。
     if selected_anntokens is not None:
         boxes = list(map(nusc.get_box, selected_anntokens))
     else:
         boxes = nusc.get_boxes(sample_data_token)
 
-    # Make list of Box objects including coord system transforms.
+    # Box 原本处于全局坐标系，依次逆变换到 ego 和传感器坐标系。
     box_list = []
     for box in boxes:
         if use_flat_vehicle_coordinates:
@@ -203,8 +222,9 @@ def get_predicted_data(sample_data_token: str,
                        pred_anns=None
                        ):
     """
-    Returns the data path as well as all annotations related to that sample_data.
-    Note that the boxes are transformed into the current sensor's coordinate frame.
+    将传入的预测框从全局坐标系转换到指定传感器坐标系。
+
+    相机模式下还会剔除画面外的预测框。
     :param sample_data_token: Sample_data token.
     :param box_vis_level: If sample_data is an image, this sets required visibility for boxes.
     :param selected_anntokens: If provided only return the selected annotation.
@@ -260,6 +280,11 @@ def get_predicted_data(sample_data_token: str,
 
 
 def lidiar_render(sample_token, data, out_path=None, out_name=None, traj_use_perstep_offset=True):
+    """整理单帧 GT/预测框，并调用 visualize_sample 生成 BEV 图。
+
+    data['results'][sample_token] 保存检测和运动预测，地图及规划结果则由
+    visualize_sample 继续从 data 中读取。
+    """
     bbox_gt_list = []
     bbox_pred_list = []
     sample_rec = nusc.get('sample', sample_token)
@@ -268,6 +293,7 @@ def lidiar_render(sample_token, data, out_path=None, out_name=None, traj_use_per
     cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
     pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
 
+    # 构造 GT 框，并沿 annotation.next 读取未来 6 帧真实轨迹。
     for ann in anns:
         content = nusc.get('sample_annotation', ann)
         gt_fut_trajs, gt_fut_masks = get_gt_fut_trajs(
@@ -291,6 +317,7 @@ def lidiar_render(sample_token, data, out_path=None, out_name=None, traj_use_per
         except:
             pass
 
+    # 将当前帧模型预测转换为统一的 CustomDetectionBox。
     bbox_anns = data['results'][sample_token]
     for content in bbox_anns:
         bbox_pred_list.append(CustomDetectionBox(
@@ -306,6 +333,7 @@ def lidiar_render(sample_token, data, out_path=None, out_name=None, traj_use_per
             detection_name=content['detection_name'],
             detection_score=-1.0 if 'detection_score' not in content else float(content['detection_score']),
             attribute_name=content['attribute_name']))
+    # EvalBoxes 以 sample_token 为键组织框。
     gt_annotations = EvalBoxes()
     pred_annotations = EvalBoxes()
     gt_annotations.add_boxes(sample_token, bbox_gt_list)
@@ -318,8 +346,7 @@ def lidiar_render(sample_token, data, out_path=None, out_name=None, traj_use_per
 
 def get_color(category_name: str):
     """
-    Provides the default colors based on the category names.
-    This method works for the general nuScenes categories, as well as the nuScenes detection categories.
+    将 VAD 检测类别名映射为 nuScenes 默认颜色。
     """
     a = ['noise', 'animal', 'human.pedestrian.adult', 'human.pedestrian.child', 'human.pedestrian.construction_worker',
      'human.pedestrian.personal_mobility', 'human.pedestrian.police_officer', 'human.pedestrian.stroller',
@@ -349,7 +376,7 @@ def get_color(category_name: str):
 # TODO: whether to rotate traj
 def boxes_to_sensor(boxes: List[EvalBox], pose_record: Dict, cs_record: Dict):
     """
-    Map boxes from global coordinates to the vehicle's sensor coordinate system.
+    将一组 EvalBox 从全局坐标系变换到当前传感器坐标系。
     :param boxes: The boxes in global coordinates.
     :param pose_record: The pose record of the vehicle at the current timestamp.
     :param cs_record: The calibrated sensor record of the sensor.
@@ -379,8 +406,9 @@ def get_gt_fut_trajs(nusc: NuScenes,
                      pose_record,
                      fut_ts) -> None:
     """
-    Visualizes a sample from BEV with annotations and detection results.
-    :param nusc: NuScenes object.
+    获取一个 GT 目标未来 fut_ts 帧的逐步位移及有效掩码。
+
+    若目标后续不再出现，剩余位移和 mask 均为 0。
     """
     box = Box(anno['translation'], anno['size'], Quaternion(anno['rotation']))
     # Move box to ego vehicle coord system.
@@ -390,7 +418,7 @@ def get_gt_fut_trajs(nusc: NuScenes,
     box.translate(-np.array(cs_record['translation']))
     box.rotate(Quaternion(cs_record['rotation']).inverse)
     
-    # get future trajectory coords for each box
+    # 在当前 LiDAR 坐标系中沿 annotation.next 向后查找目标。
     gt_fut_trajs = np.zeros((fut_ts, 2))  # [fut_ts*2]
     gt_fut_masks = np.zeros((fut_ts))  # [fut_ts]
     gt_fut_trajs[:] = box.center[:2]
@@ -429,7 +457,9 @@ def get_gt_vec_maps(
     map_fixed_ptsnum_per_line=20
 ) -> None:
     """
-    Get gt vec map for a given sample.
+    提取指定 sample 周围的 GT 矢量地图元素及类别标签。
+
+    当前视频主流程只绘制预测地图，没有直接调用本函数。
     """
     sample_rec = nusc.get('sample', sample_token)
     sd_record = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
@@ -441,6 +471,7 @@ def get_gt_vec_maps(
     ego2global_rotation = pose_record['rotation'],
     map_location = nusc.get('log', nusc.get('scene', sample_rec['scene_token'])['log_token'])['location']
 
+    # 组合 lidar->ego 与 ego->global，得到 LiDAR 的全局位姿。
     lidar2ego = np.eye(4)
     lidar2ego[:3,:3] = Quaternion(cs_record['rotation']).rotation_matrix
     lidar2ego[:3, 3] = cs_record['translation']
@@ -502,7 +533,9 @@ def visualize_sample(nusc: NuScenes,
                      colors_plt = ['cornflowerblue', 'royalblue', 'slategrey'],
                      pred_data = None) -> None:
     """
-    Visualizes a sample from BEV with annotations and detection results.
+    绘制一帧 VAD 鸟瞰预测图并保存为 bev_pred.png。
+
+    内容包括预测矢量地图、目标框与未来轨迹，以及自车规划轨迹。
     :param nusc: NuScenes object.
     :param sample_token: The nuScenes sample token.
     :param gt_boxes: Ground truth boxes grouped by sample.
@@ -513,12 +546,12 @@ def visualize_sample(nusc: NuScenes,
     :param verbose: Whether to print to stdout.
     :param savepath: If given, saves the the rendering here instead of displaying.
     """
-    # Retrieve sensor & pose records.
+    # 获取顶置 LiDAR 标定和车辆位姿，供 global -> lidar 变换使用。
     sample_rec = nusc.get('sample', sample_token)
     sd_record = nusc.get('sample_data', sample_rec['data']['LIDAR_TOP'])
     cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
     pose_record = nusc.get('ego_pose', sd_record['ego_pose_token'])
-    # Get boxes.
+    # 取出当前帧 GT 和预测框，并统一转换到 LiDAR 坐标系。
     boxes_gt_global = gt_boxes[sample_token]
     boxes_est_global = pred_boxes[sample_token]
     # Map GT boxes to lidar.
@@ -529,12 +562,12 @@ def visualize_sample(nusc: NuScenes,
     for box_est, box_est_global in zip(boxes_est, boxes_est_global):
         box_est.score = box_est_global.detection_score
 
-    # Init axes.
+    # 初始化以 LiDAR 为中心、前后左右各 30 m 的 BEV 画布。
     fig, axes = plt.subplots(1, 1, figsize=(4, 4))
     plt.xlim(xmin=-30, xmax=30)
     plt.ylim(ymin=-30, ymax=30)
 
-    # Show Pred Map
+    # 1) 绘制预测矢量地图，仅保留置信度不低于 0.6 的折线。
     result_dic = pred_data['map_results'][sample_token]['vectors']
 
     for vector in result_dic:
@@ -551,7 +584,7 @@ def visualize_sample(nusc: NuScenes,
     # ignore_list = ['barrier', 'motorcycle', 'bicycle', 'traffic_cone']
     ignore_list = ['barrier', 'bicycle', 'traffic_cone']
 
-    # Show Pred boxes.
+    # 2) 绘制预测目标框及未来轨迹，并按类别、分数和范围过滤。
     for i, box in enumerate(boxes_est):
         if box.name in ignore_list:
             continue
@@ -568,12 +601,13 @@ def visualize_sample(nusc: NuScenes,
         else:
             box.render_fut_trajs_coords(axes, color='tomato', linewidth=1)
 
-    # Show Planning.
+    # 3) 绘制自车轮廓和自车规划轨迹。
     axes.plot([-0.9, -0.9], [-2, 2], color='mediumseagreen', linewidth=1, alpha=0.8)
     axes.plot([-0.9, 0.9], [2, 2], color='mediumseagreen', linewidth=1, alpha=0.8)
     axes.plot([0.9, 0.9], [2, -2], color='mediumseagreen', linewidth=1, alpha=0.8)
     axes.plot([0.9, -0.9], [-2, -2], color='mediumseagreen', linewidth=1, alpha=0.8)
     axes.plot([0.0, 0.0], [0.0, 2], color='mediumseagreen', linewidth=1, alpha=0.8)
+    # 选择导航命令对应的分支；逐步位移累加后才是轨迹坐标。
     plan_cmd = np.argmax(pred_data['plan_results'][sample_token][1][0,0,0])
     plan_traj = pred_data['plan_results'][sample_token][0][plan_cmd]
     plan_traj[abs(plan_traj) < 0.01] = 0.0
@@ -581,6 +615,7 @@ def visualize_sample(nusc: NuScenes,
     plan_traj = np.concatenate((np.zeros((1, plan_traj.shape[1])), plan_traj), axis=0)
     plan_traj = np.stack((plan_traj[:-1], plan_traj[1:]), axis=1)
 
+    # 将轨迹段细分，以便绘制连续的时间渐变色。
     plan_vecs = None
     for i in range(plan_traj.shape[0]):
         plan_vec_i = plan_traj[i]
@@ -615,7 +650,9 @@ def obtain_sensor2top(nusc,
                       e2g_t,
                       e2g_r_mat,
                       sensor_type='lidar'):
-    """Obtain the info with RT matric from general sensor to Top LiDAR.
+    """计算任意传感器坐标系到当前顶置 LiDAR 的旋转和平移。
+
+    变换链为 sensor -> ego -> global -> 当前 ego -> LIDAR_TOP。
 
     Args:
         nusc (class): Dataset class in the nuScenes dataset.
@@ -691,7 +728,7 @@ def render_sample_data(
         traj_use_perstep_offset: bool = True
       ) -> None:
     """
-    Render sample data onto axis.
+    单帧 BEV 渲染入口；当前实现最终转调 lidiar_render。
     :param sample_data_token: Sample_data token.
     :param with_anns: Whether to draw box annotations.
     :param box_vis_level: If sample_data is an image, this sets required visibility for boxes.
@@ -721,6 +758,7 @@ def render_sample_data(
 
 
 def parse_args():
+    """解析推理结果文件和可视化输出目录。"""
     parser = argparse.ArgumentParser(description='Visualize VAD predictions')
     parser.add_argument('--result-path', help='inference result file path')
     parser.add_argument('--save-path', help='the dir to save visualization results')
@@ -730,6 +768,8 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    # 推理结果含 results（检测/运动）、map_results（地图）和
+    # plan_results（各导航命令对应的自车规划轨迹）。
     args = parse_args()
     inference_result_path = args.result_path
     out_path = args.save_path
@@ -738,12 +778,15 @@ if __name__ == '__main__':
 
     nusc = NuScenes(version='v1.0-trainval', dataroot='./data/nuscenes', verbose=True)
     
+    # 输出视频由左侧六相机拼图和右侧 BEV 图组成。
     imgs = []
     fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
     video_path = osp.join(out_path, 'vis.mp4')
     video = cv2.VideoWriter(video_path, fourcc, 10, (2933, 800), True)
+    # 每个 sample_token 生成一帧视频。
     for id in tqdm(range(len(sample_token_list))):
         mmcv.mkdir_or_exist(out_path)
+        # 先生成临时 BEV 图片，读入内存后删除。
         render_sample_data(sample_token_list[id],
                            pred_data=bevformer_results,
                            out_path=out_path)
@@ -754,6 +797,7 @@ if __name__ == '__main__':
         sample_token = sample_token_list[id]
         sample = nusc.get('sample', sample_token)
         # sample = data['results'][sample_token_list[0]][0]
+        # 前三路和后三路相机最终分别拼成一行。
         cams = [
             'CAM_FRONT_LEFT',
             'CAM_FRONT',
@@ -764,6 +808,7 @@ if __name__ == '__main__':
         ]
 
         cam_imgs = []
+        # 逐相机读取原图，并筛选落在画面内的预测框。
         for cam in cams:
             sample_data_token = sample['data'][cam]
             sd_record = nusc.get('sample_data', sample_data_token)
@@ -785,13 +830,13 @@ if __name__ == '__main__':
                 _, ax = plt.subplots(1, 1, figsize=(6, 12))
                 ax.imshow(data)
 
+                # 仅在前视相机上投影并绘制自车规划轨迹。
                 if cam == 'CAM_FRONT':
                     lidar_sd_record =  nusc.get('sample_data', sample['data']['LIDAR_TOP'])
                     lidar_cs_record = nusc.get('calibrated_sensor', lidar_sd_record['calibrated_sensor_token'])
                     lidar_pose_record = nusc.get('ego_pose', lidar_sd_record['ego_pose_token'])
 
-                    # get plan traj [x,y,z,w] quaternion, w=1
-                    # we set z=-1 to get points near the ground in lidar coord system
+                    # 累加逐步位移，再补 z=-1、w=1 形成齐次坐标 [x,y,z,1]。
                     plan_cmd = np.argmax(bevformer_results['plan_results'][sample_token][1][0,0,0])
                     plan_traj = bevformer_results['plan_results'][sample_token][0][plan_cmd]
                     plan_traj[abs(plan_traj) < 0.01] = 0.0
@@ -817,7 +862,7 @@ if __name__ == '__main__':
                     l2e_r_mat = Quaternion(l2e_r).rotation_matrix
                     e2g_r_mat = Quaternion(e2g_r).rotation_matrix
                     s2l_r, s2l_t = obtain_sensor2top(nusc, sample_data_token, l2e_t, l2e_r_mat, e2g_t, e2g_r_mat, cam)
-                    # obtain lidar to image transformation matrix
+                    # 组合外参和内参得到 lidar->image 投影矩阵。
                     lidar2cam_r = np.linalg.inv(s2l_r)
                     lidar2cam_t = s2l_t @ lidar2cam_r.T
                     lidar2cam_rt = np.eye(4)
@@ -897,6 +942,7 @@ if __name__ == '__main__':
         pred_img = cv2.putText(pred_img, plan_cmd_str, (20, 770), font, 
                         fontScale, color, thickness, cv2.LINE_AA)
         
+        # 六相机图按 2x3 拼接，再与 BEV 图横向合并。
         sample_img = pred_img
         cam_img_top = cv2.hconcat([cam_imgs[0], cam_imgs[1], cam_imgs[2]])
         cam_img_down = cv2.hconcat([cam_imgs[3], cam_imgs[4], cam_imgs[5]])
@@ -907,5 +953,6 @@ if __name__ == '__main__':
 
         video.write(vis_img)
     
+    # 所有帧写完后关闭视频编码器。
     video.release()
     cv2.destroyAllWindows()

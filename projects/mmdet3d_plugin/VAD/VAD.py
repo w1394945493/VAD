@@ -1,5 +1,7 @@
 import time
 import copy
+import os
+import warnings
 
 import torch
 from mmdet.models import DETECTORS
@@ -380,59 +382,190 @@ class VAD(MVXTwoStageDetector):
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=rescale)
 
-        bbox_results = []
-        for i, (bboxes, scores, labels, trajs, map_bboxes, \
-                map_scores, map_labels, map_pts) in enumerate(bbox_list):
-            bbox_result = bbox3d2result(bboxes, scores, labels)
-            bbox_result['trajs_3d'] = trajs.cpu()
-            map_bbox_result = self.map_pred2result(map_bboxes, map_scores, map_labels, map_pts)
-            bbox_result.update(map_bbox_result)
-            bbox_result['ego_fut_preds'] = outs['ego_fut_preds'][i].cpu()
-            bbox_result['ego_fut_cmd'] = ego_fut_cmd.cpu()
-            bbox_results.append(bbox_result)
+        bbox_results = []  # 保存 batch 内各样本的完整预测结果。
+        for i, (bboxes, scores, labels, trajs, map_bboxes,  # 逐样本拆出检测与地图结果。 \
+                map_scores, map_labels, map_pts) in enumerate(bbox_list):  # i 为 batch 索引。
+            bbox_result = bbox3d2result(bboxes, scores, labels)  # 转为标准 3D 检测结果字典。
+            bbox_result['trajs_3d'] = trajs.cpu()  # 保存各目标的未来轨迹。
+            map_bbox_result = self.map_pred2result(map_bboxes, map_scores, map_labels, map_pts)  # 整理地图预测。
+            bbox_result.update(map_bbox_result)  # 将地图结果并入检测结果。
+            bbox_result['ego_fut_preds'] = outs['ego_fut_preds'][i].cpu()  # 保存自车多指令轨迹预测。
+            bbox_result['ego_fut_cmd'] = ego_fut_cmd.cpu()  # 保存自车驾驶指令。
+            bbox_results.append(bbox_result)  # 收集当前样本结果。
 
-        assert len(bbox_results) == 1, 'only support batch_size=1 now'
-        score_threshold = 0.6
-        with torch.no_grad():
-            c_bbox_results = copy.deepcopy(bbox_results)
+        assert len(bbox_results) == 1, 'only support batch_size=1 now'  # 当前评测仅支持 batch_size=1。
+        score_threshold = 0.6  # 预测目标的置信度筛选阈值。
+        with torch.no_grad():  # 指标计算无需构建梯度图。
+            c_bbox_results = copy.deepcopy(bbox_results)  # 避免评测过滤改动原结果。
 
-            bbox_result = c_bbox_results[0]
-            gt_bbox = gt_bboxes_3d[0][0]
-            gt_label = gt_labels_3d[0][0].to('cpu')
-            gt_attr_label = gt_attr_labels[0][0].to('cpu')
-            fut_valid_flag = bool(fut_valid_flag[0][0])
-            # filter pred bbox by score_threshold
-            mask = bbox_result['scores_3d'] > score_threshold
-            bbox_result['boxes_3d'] = bbox_result['boxes_3d'][mask]
-            bbox_result['scores_3d'] = bbox_result['scores_3d'][mask]
-            bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]
-            bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]
+            bbox_result = c_bbox_results[0]  # 取 batch 中唯一的预测结果。
+            gt_bbox = gt_bboxes_3d[0][0]  # 当前帧真值 3D 框。
+            gt_label = gt_labels_3d[0][0].to('cpu')  # 真值类别移至 CPU。
+            gt_attr_label = gt_attr_labels[0][0].to('cpu')  # 真值未来属性移至 CPU。
+            fut_valid_flag = bool(fut_valid_flag[0][0])  # 未来轨迹真值是否有效。
+            # 按置信度阈值过滤预测目标。
+            mask = bbox_result['scores_3d'] > score_threshold  # True 表示保留该目标。
+            bbox_result['boxes_3d'] = bbox_result['boxes_3d'][mask]  # 过滤检测框。
+            bbox_result['scores_3d'] = bbox_result['scores_3d'][mask]  # 同步过滤分数。
+            bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]  # 同步过滤类别。
+            bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]  # 同步过滤目标轨迹。
 
-            matched_bbox_result = self.assign_pred_to_gt_vip3d(
-                bbox_result, gt_bbox, gt_label)
+            # 调试可视化：设置 VAD_DEBUG_VIS_DIR 后才执行，默认不影响测试。
+            debug_vis_dir = os.getenv('VAD_DEBUG_VIS_DIR')
+            if debug_vis_dir:
+                try:
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    from matplotlib.collections import LineCollection
+                    from matplotlib import cm
 
-            metric_dict = self.compute_motion_metric_vip3d(
+                    def to_numpy(value):
+                        if hasattr(value, 'detach'):
+                            value = value.detach()
+                        if hasattr(value, 'cpu'):
+                            value = value.cpu()
+                        return value.numpy() if hasattr(value, 'numpy') else np.asarray(value)
+
+                    def draw_traj(ax, points, cmap_name, width, alpha=1.0):
+                        points = np.asarray(points)
+                        if len(points) < 2:
+                            return
+                        segments = np.stack([points[:-1], points[1:]], axis=1)
+                        colors = cm.get_cmap(cmap_name)(
+                            np.linspace(0.15, 0.95, len(segments)))
+                        colors[:, 3] *= alpha
+                        ax.add_collection(LineCollection(
+                            segments, colors=colors, linewidths=width, zorder=5))
+
+                    os.makedirs(debug_vis_dir, exist_ok=True)
+                    frame_id = str(img_metas[0].get(
+                        'sample_idx', img_metas[0].get('token', 'frame')))
+                    frame_id = ''.join(
+                        c if c.isalnum() or c in '-_' else '_' for c in frame_id)
+
+                    boxes = to_numpy(bbox_result['boxes_3d'].tensor)
+                    scores = to_numpy(bbox_result['scores_3d'])
+                    labels = to_numpy(bbox_result['labels_3d']).astype(np.int64)
+                    trajs = to_numpy(bbox_result['trajs_3d'])
+                    map_scores = to_numpy(bbox_result['map_scores_3d'])
+                    map_labels = to_numpy(
+                        bbox_result['map_labels_3d']).astype(np.int64)
+                    map_pts = to_numpy(bbox_result['map_pts_3d'])
+                    ego_preds_np = to_numpy(bbox_result['ego_fut_preds'])
+                    ego_cmd_np = to_numpy(bbox_result['ego_fut_cmd'])
+
+                    # 同名 NPZ 保存纯数组，可复制到无 mmdet3d 的机器离线重画。
+                    np.savez_compressed(
+                        os.path.join(debug_vis_dir, frame_id + '.npz'),
+                        boxes_3d=boxes, scores_3d=scores, labels_3d=labels,
+                        trajs_3d=trajs, map_scores_3d=map_scores,
+                        map_labels_3d=map_labels, map_pts_3d=map_pts,
+                        ego_fut_preds=ego_preds_np, ego_fut_cmd=ego_cmd_np,
+                        class_names=np.asarray(mapped_class_names))
+
+                    fig, ax = plt.subplots(1, 1, figsize=(6, 12))
+                    map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
+                    for pts, score, label in zip(
+                            map_pts, map_scores, map_labels):
+                        if score < 0.6:
+                            continue
+                        pts = np.asarray(pts).reshape(-1, 2)
+                        color = map_colors[int(label) % len(map_colors)]
+                        ax.plot(pts[:, 0], pts[:, 1], color=color,
+                                linewidth=1, alpha=0.8, zorder=1)
+                        ax.scatter(pts[:, 0], pts[:, 1], color=color,
+                                   s=2, alpha=0.8, zorder=1)
+
+                    # 绘制目标 BEV 框、类别/分数及全部未来轨迹模态。
+                    for box, score, label, obj_trajs in zip(
+                            boxes, scores, labels, trajs):
+                        x, y, width, length, yaw = (
+                            box[0], box[1], box[3], box[4], box[6])
+                        local = np.array([
+                            [-width / 2, -length / 2],
+                            [-width / 2, length / 2],
+                            [width / 2, length / 2],
+                            [width / 2, -length / 2],
+                            [-width / 2, -length / 2]])
+                        rotation = np.array([
+                            [np.cos(yaw), -np.sin(yaw)],
+                            [np.sin(yaw), np.cos(yaw)]])
+                        corners = local @ rotation.T + np.array([x, y])
+                        ax.plot(corners[:, 0], corners[:, 1],
+                                color='tomato', linewidth=1.2, zorder=3)
+                        name = mapped_class_names[int(label)]
+                        ax.text(x, y, '{} {:.2f}'.format(name, score),
+                                color='darkred', fontsize=6, zorder=6)
+                        obj_trajs = np.asarray(obj_trajs).reshape(
+                            self.fut_mode, self.fut_ts, 2)
+                        for mode_traj in obj_trajs:
+                            coords = np.cumsum(
+                                mode_traj[..., :2], axis=-2) + [x, y]
+                            coords = np.concatenate(
+                                [np.array([[x, y]]), coords], axis=0)
+                            draw_traj(ax, coords, 'autumn', 1.0, 0.65)
+
+                    # 参考 visualization.py：绿色自车轮廓、winter 渐变规划轨迹。
+                    ego_box = np.array([
+                        [-0.9, -2], [-0.9, 2], [0.9, 2],
+                        [0.9, -2], [-0.9, -2]])
+                    ax.plot(ego_box[:, 0], ego_box[:, 1],
+                            color='mediumseagreen', linewidth=1.2)
+                    ax.plot([0, 0], [0, 2], color='mediumseagreen',
+                            linewidth=1.2)
+                    ego_preds_np = np.squeeze(ego_preds_np)
+                    cmd_idx = int(np.argmax(np.squeeze(ego_cmd_np).reshape(-1)))
+                    ego_traj = (ego_preds_np if ego_preds_np.ndim == 2
+                                else ego_preds_np[cmd_idx])
+                    ego_traj = np.cumsum(ego_traj[..., :2], axis=-2)
+                    ego_traj = np.concatenate(
+                        [np.zeros((1, 2)), ego_traj], axis=0)
+                    draw_traj(ax, ego_traj, 'winter', 2.2)
+
+                    ax.set(xlim=(-15, 15), ylim=(-30, 30),
+                           xlabel='x / m', ylabel='y / m')
+                    ax.set_aspect('equal')
+                    ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
+                    ax.set_title('VAD prediction: {}'.format(frame_id))
+                    fig.tight_layout()
+                    fig.savefig(
+                        os.path.join(debug_vis_dir, frame_id + '.png'),
+                        bbox_inches='tight', dpi=200)
+                    plt.close(fig)
+                except Exception as error:
+                    warnings.warn(
+                        'VAD debug visualization failed: {}'.format(error))
+
+
+            matched_bbox_result = self.assign_pred_to_gt_vip3d(  # 将预测目标匹配至真值。
+                bbox_result, gt_bbox, gt_label)  # 输入过滤后的预测、真值框和类别。
+
+            metric_dict = self.compute_motion_metric_vip3d(  # 计算目标运动预测指标。
                 gt_bbox, gt_label, gt_attr_label, bbox_result,
-                matched_bbox_result, mapped_class_names)
+                matched_bbox_result, mapped_class_names)  # 使用匹配关系和类别映射。
 
-            # ego planning metric
-            assert ego_fut_trajs.shape[0] == 1, 'only support batch_size=1 for testing'
-            ego_fut_preds = bbox_result['ego_fut_preds']
-            ego_fut_trajs = ego_fut_trajs[0, 0]
-            ego_fut_cmd = ego_fut_cmd[0, 0, 0]
-            ego_fut_cmd_idx = torch.nonzero(ego_fut_cmd)[0, 0]
-            ego_fut_pred = ego_fut_preds[ego_fut_cmd_idx]
-            ego_fut_pred = ego_fut_pred.cumsum(dim=-2)
-            ego_fut_trajs = ego_fut_trajs.cumsum(dim=-2)
+            # 计算自车规划轨迹指标。
+            assert ego_fut_trajs.shape[0] == 1, 'only support batch_size=1 for testing'  # 规划评测仅支持 batch_size=1。
+            ego_fut_preds = bbox_result['ego_fut_preds']  # 各驾驶指令对应的预测轨迹。
+            ego_fut_trajs = ego_fut_trajs[0, 0]  # 当前样本的自车真值轨迹。
+            ego_fut_cmd = ego_fut_cmd[0, 0, 0]  # 当前样本的 one-hot 驾驶指令。
+            ego_fut_cmd_idx = torch.nonzero(ego_fut_cmd)[0, 0]  # 获得有效指令索引。
+            ego_fut_pred = ego_fut_preds[ego_fut_cmd_idx]  # 选择对应指令的规划轨迹。
+            ego_fut_pred = ego_fut_pred.cumsum(dim=-2)  # 逐步位移累加为绝对轨迹点。
+            ego_fut_trajs = ego_fut_trajs.cumsum(dim=-2)  # 真值位移执行相同累加。
 
-            metric_dict_planner_stp3 = self.compute_planner_metric_stp3(
-                pred_ego_fut_trajs = ego_fut_pred[None],
-                gt_ego_fut_trajs = ego_fut_trajs[None],
-                gt_agent_boxes = gt_bbox,
-                gt_agent_feats = gt_attr_label.unsqueeze(0),
-                fut_valid_flag = fut_valid_flag
+            metric_dict_planner_stp3 = self.compute_planner_metric_stp3(  # 计算 ST-P3 规划指标。
+                pred_ego_fut_trajs = ego_fut_pred[None],  # 预测轨迹补回 batch 维。
+                gt_ego_fut_trajs = ego_fut_trajs[None],  # 真值轨迹补回 batch 维。
+                gt_agent_boxes = gt_bbox,  # 周围参与者的真值框。
+                gt_agent_feats = gt_attr_label.unsqueeze(0),  # 参与者未来属性及 batch 维。
+                fut_valid_flag = fut_valid_flag  # 是否评测该未来序列。
             )
-            metric_dict.update(metric_dict_planner_stp3)
+            metric_dict.update(metric_dict_planner_stp3)  # 合并运动预测与规划指标。
+
+
 
         return outs['bev_embed'], bbox_results, metric_dict
 

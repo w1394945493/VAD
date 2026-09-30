@@ -1999,38 +1999,48 @@ class VADHead(DETRHead):
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_bboxes(self, preds_dicts, img_metas, rescale=False):
-        """Generate bboxes from bbox head predictions.
+        """将网络输出解码为可用于评测或可视化的检测与地图结果。
+
         Args:
-            preds_dicts (tuple[list[dict]]): Prediction results.
-            img_metas (list[dict]): Point cloud and image's meta info.
+            preds_dicts: 检测头原始输出，包含目标框、轨迹和地图预测。
+            img_metas: batch 内各样本元信息，用于构造项目约定的 3D 框。
+            rescale: 接口兼容参数，本函数中未使用。
+
         Returns:
-            list[dict]: Decoded bbox, scores and labels after nms.
+            每个样本的检测框、分数、类别、轨迹及地图元素结果。
         """
 
+        # 解码动态目标分支：3D 框、类别、置信度和未来轨迹。
         det_preds_dicts = self.bbox_coder.decode(preds_dicts)
-        # map_bboxes: xmin, ymin, xmax, ymax
+        # 解码地图分支；map_bboxes 格式为 [xmin, ymin, xmax, ymax]。
         map_preds_dicts = self.map_bbox_coder.decode(preds_dicts)
 
+        # 两个解码器都应为 batch 中的每个样本返回一组结果。
         num_samples = len(det_preds_dicts)
         assert len(det_preds_dicts) == len(map_preds_dicts), \
              'len(preds_dict) should be equal to len(map_preds_dicts)'
         ret_list = []
         for i in range(num_samples):
+            # 动态目标检测与运动预测结果。
             preds = det_preds_dicts[i]
             bboxes = preds['bboxes']
+            # 将框的 z 坐标从几何中心下移到其底面中心。
             bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 5] * 0.5
             code_size = bboxes.shape[-1]
+            # 将 Tensor 包装成数据集指定的 3D 框类型。
             bboxes = img_metas[i]['box_type_3d'](bboxes, code_size)
             scores = preds['scores']
             labels = preds['labels']
             trajs = preds['trajs']
 
+            # 静态地图元素的预测结果。
             map_preds = map_preds_dicts[i]
             map_bboxes = map_preds['map_bboxes']
             map_scores = map_preds['map_scores']
             map_labels = map_preds['map_labels']
             map_pts = map_preds['map_pts']
 
+            # 按下游约定的固定顺序合并当前样本的两类结果。
             ret_list.append([bboxes, scores, labels, trajs, map_bboxes,
                              map_scores, map_labels, map_pts])
 
