@@ -424,8 +424,11 @@ class VAD(MVXTwoStageDetector):
             bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]  # 同步过滤类别。
             bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]  # 同步过滤目标轨迹。
 
-            # *=================================================#
-            # 调试可视化阈值独立于指标阈值，默认均为 0.3。
+            #*=====================================================#
+            #* 调试可视化：仅设置 VAD_DEBUG_VIS_DIR 时启用。
+            #*-----------------------------------------------------#
+            #* 1. 读取可视化阈值与输出分辨率配置
+            # 检测/地图阈值独立于评测阈值，默认 0.3；DPI 默认 120。
             if debug_vis_dir:
                 vis_score_threshold = float(
                     os.getenv('VAD_DEBUG_SCORE_THRESHOLD', '0.3'))
@@ -440,6 +443,8 @@ class VAD(MVXTwoStageDetector):
                     from matplotlib.collections import LineCollection
                     from matplotlib import cm
 
+                    #*-----------------------------------------------------#
+                    #* 2. 定义张量转换与渐变轨迹绘制工具
                     def to_numpy(value):
                         if hasattr(value, 'detach'):
                             value = value.detach()
@@ -458,6 +463,8 @@ class VAD(MVXTwoStageDetector):
                         ax.add_collection(LineCollection(
                             segments, colors=colors, linewidths=width, zorder=5))
 
+                    #*-----------------------------------------------------#
+                    #* 3. 解析帧标识并创建当前场景的输出目录
                     # 每个 scene 使用独立目录，帧文件按场景内 frame_idx 排序。
                     sample_idx = str(img_metas[0]['sample_idx'])
                     scene_token = str(img_metas[0]['scene_token'])
@@ -470,6 +477,9 @@ class VAD(MVXTwoStageDetector):
                     os.makedirs(scene_vis_dir, exist_ok=True)
                     frame_name = 'frame_{:03d}'.format(frame_idx)
 
+                    #*-----------------------------------------------------#
+                    #* 4. 提取未经评测阈值过滤的预测结果
+                    # 包括目标框/类别/轨迹、地图实例及自车规划结果。
                     boxes = to_numpy(vis_bbox_result['boxes_3d'].tensor)
                     scores = to_numpy(vis_bbox_result['scores_3d'])
                     labels = to_numpy(vis_bbox_result['labels_3d']).astype(np.int64)
@@ -490,6 +500,8 @@ class VAD(MVXTwoStageDetector):
                     #     ego_fut_preds=ego_preds_np, ego_fut_cmd=ego_cmd_np,
                     #     class_names=np.asarray(mapped_class_names))
 
+                    #*-----------------------------------------------------#
+                    #* 5. 创建画布并绘制六路环视原图
                     # 紧凑布局：左侧 2x3 环视，中间预测，右侧 GT。
                     fig = plt.figure(figsize=(16, 4.8))
                     outer_grid = fig.add_gridspec(
@@ -525,6 +537,8 @@ class VAD(MVXTwoStageDetector):
                                 edgecolor='none', pad=1.0))
                         camera_ax.axis('off')
 
+                    #*-----------------------------------------------------#
+                    #* 6. 绘制预测 BEV：地图、目标框/轨迹和自车轨迹
                     # 暖色表示预测地图，蓝灰色表示 GT 地图。
                     pred_map_colors = ['darkorange', 'goldenrod', 'tomato']
                     gt_map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
@@ -571,7 +585,7 @@ class VAD(MVXTwoStageDetector):
                                 [np.array([[x, y]]), coords], axis=0)
                             draw_traj(ax, coords, 'autumn', 1.0, 0.65)
 
-                    # 参考 visualization.py：绿色自车轮廓、winter 渐变规划轨迹。
+                    # 绿色轮廓表示自车，紫红渐变表示预测自车轨迹。
                     ego_box = np.array([
                         [-0.9, -2], [-0.9, 2], [0.9, 2],
                         [0.9, -2], [-0.9, -2]])
@@ -593,16 +607,23 @@ class VAD(MVXTwoStageDetector):
                            xlabel='x / m', ylabel='y / m')
                     ax.set_aspect('equal')
                     ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
-                    ax.set_title(
-                        'Prediction\nobjects {}/{} (>{:.2f}), maps {}/{} (>{:.2f})'.format(
+                    # 统计信息放入图内，避免窄子图的标题相互重叠。
+                    ax.text(
+                        0.02, 0.98,
+                        'Objects: {}/{} (>{:.2f})\nMaps: {}/{} (>{:.2f})'.format(
                             int((scores >= vis_score_threshold).sum()),
                             len(scores), vis_score_threshold,
                             int((map_scores >= vis_map_threshold).sum()),
-                            len(map_scores), vis_map_threshold))
+                            len(map_scores), vis_map_threshold),
+                        transform=ax.transAxes, va='top', ha='left',
+                        fontsize=6, zorder=10,
+                        bbox=dict(
+                            facecolor='white', alpha=0.75,
+                            edgecolor='none', pad=1.5))
 
-                    #* -----------------------------------------#
-                    #* 可视化真值
-                    # 整理并保存当前函数能够取得的全部 GT。
+                    #*-----------------------------------------------------#
+                    #* 7. 提取 GT：目标框/轨迹、地图实例和自车轨迹
+                    # 整理当前函数能够取得的全部 GT。
                     def unwrap_singleton(value):
                         while isinstance(value, (list, tuple)) and len(value) == 1:
                             value = value[0]
@@ -638,6 +659,8 @@ class VAD(MVXTwoStageDetector):
                     #     ego_fut_traj=ego_gt_np,
                     #     class_names=np.asarray(mapped_class_names))
 
+                    #*-----------------------------------------------------#
+                    #* 8. 绘制 GT BEV：地图、目标框/轨迹和自车轨迹
                     # GT 绘制在同一画布的右侧子图。
                     for pts, label in zip(gt_map_pts_np, gt_map_labels_np):
                         pts = np.asarray(pts).reshape(-1, 2)
@@ -688,16 +711,31 @@ class VAD(MVXTwoStageDetector):
                               xlabel='x / m', ylabel='y / m')
                     gt_ax.set_aspect('equal')
                     gt_ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
-                    gt_ax.set_title(
-                        'Ground truth\nobjects {}, maps {}, ego valid {}'.format(
+                    gt_ax.text(
+                        0.02, 0.98,
+                        'Objects: {}\nMaps: {}\nEgo future valid: {}'.format(
                             len(gt_boxes_np), len(gt_map_pts_np),
-                            bool(fut_valid_flag)))
+                            bool(fut_valid_flag)),
+                        transform=gt_ax.transAxes, va='top', ha='left',
+                        fontsize=6, zorder=10,
+                        bbox=dict(
+                            facecolor='white', alpha=0.75,
+                            edgecolor='none', pad=1.5))
 
-                    # 总标题同时显示当前帧 token 和场景内整数帧号。
-                    fig.suptitle(
-                        'sample_idx: {}    frame_idx: {}'.format(
+                    #*-----------------------------------------------------#
+                    #* 9. 添加帧信息并保存最终组合图
+                    # 三个区域的标题保持在同一水平线上。
+                    fig.text(
+                        0.365, 0.94,
+                        'Sample Token: {}    |    Frame Number: {}'.format(
                             sample_idx, frame_idx),
-                        fontsize=10)
+                        ha='center', va='center', fontsize=8)
+                    fig.text(
+                        0.805, 0.94, 'Prediction',
+                        ha='center', va='center', fontsize=9)
+                    fig.text(
+                        0.94, 0.94, 'Ground Truth',
+                        ha='center', va='center', fontsize=9)
                     # 手动控制边距，避免 tight_layout 拉开相机子图间距。
                     fig.subplots_adjust(
                         left=0.005, right=0.995, bottom=0.04, top=0.88)
@@ -708,7 +746,7 @@ class VAD(MVXTwoStageDetector):
                 except Exception as error:
                     warnings.warn(
                         'VAD debug visualization failed: {}'.format(error))
-            # *=================================================#
+            #*=====================================================#
 
             matched_bbox_result = self.assign_pred_to_gt_vip3d(  # 将预测目标匹配至真值。
                 bbox_result, gt_bbox, gt_label)  # 输入过滤后的预测、真值框和类别。
