@@ -12,7 +12,8 @@ from mmcv.runner import load_checkpoint
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 
-
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
 # 保证从任意目录执行脚本时都能导入 projects.mmdet3d_plugin。
 sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
 
