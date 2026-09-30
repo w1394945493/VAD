@@ -431,6 +431,7 @@ class VAD(MVXTwoStageDetector):
                     os.getenv('VAD_DEBUG_SCORE_THRESHOLD', '0.3'))
                 vis_map_threshold = float(
                     os.getenv('VAD_DEBUG_MAP_THRESHOLD', '0.3'))
+                vis_dpi = int(os.getenv('VAD_DEBUG_VIS_DPI', '120'))
                 try:
                     import matplotlib
                     matplotlib.use('Agg')
@@ -489,16 +490,19 @@ class VAD(MVXTwoStageDetector):
                     #     ego_fut_preds=ego_preds_np, ego_fut_cmd=ego_cmd_np,
                     #     class_names=np.asarray(mapped_class_names))
 
-                    # 左侧 2x3 环视图，中间预测 BEV，右侧 GT BEV。
-                    fig = plt.figure(figsize=(24, 10))
-                    grid = fig.add_gridspec(
-                        2, 5, width_ratios=[1, 1, 1, 1.1, 1.1])
+                    # 紧凑布局：左侧 2x3 环视，中间预测，右侧 GT。
+                    fig = plt.figure(figsize=(16, 4.8))
+                    outer_grid = fig.add_gridspec(
+                        1, 3, width_ratios=[5.4, 1, 1],
+                        wspace=0.04)
+                    camera_grid = outer_grid[0].subgridspec(
+                        2, 3, wspace=0.01, hspace=0.01)
                     camera_axes = [
-                        fig.add_subplot(grid[row, col])
+                        fig.add_subplot(camera_grid[row, col])
                         for row in range(2) for col in range(3)]
-                    ax = fig.add_subplot(grid[:, 3])
+                    ax = fig.add_subplot(outer_grid[1])
                     gt_ax = fig.add_subplot(
-                        grid[:, 4], sharex=ax, sharey=ax)
+                        outer_grid[2], sharex=ax, sharey=ax)
 
                     # filename 的原始顺序为 FRONT、FRONT_RIGHT、FRONT_LEFT、
                     # BACK、BACK_LEFT、BACK_RIGHT；这里调整为更直观的环视布局。
@@ -509,17 +513,28 @@ class VAD(MVXTwoStageDetector):
                     image_paths = img_metas[0]['filename']
                     for camera_ax, camera_name, camera_index in zip(
                             camera_axes, camera_names, camera_order):
-                        camera_ax.imshow(plt.imread(image_paths[camera_index]))
-                        camera_ax.set_title(camera_name, fontsize=9)
+                        camera_ax.imshow(
+                            plt.imread(image_paths[camera_index]))
+                        # 相机名叠加在图像内部，避免标题额外占用纵向空间。
+                        camera_ax.text(
+                            0.01, 0.97, camera_name,
+                            transform=camera_ax.transAxes,
+                            va='top', ha='left', color='white', fontsize=7,
+                            bbox=dict(
+                                facecolor='black', alpha=0.45,
+                                edgecolor='none', pad=1.0))
                         camera_ax.axis('off')
 
-                    map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
+                    # 暖色表示预测地图，蓝灰色表示 GT 地图。
+                    pred_map_colors = ['darkorange', 'goldenrod', 'tomato']
+                    gt_map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
                     for pts, score, label in zip(
                             map_pts, map_scores, map_labels):
                         if score < vis_map_threshold:
                             continue
                         pts = np.asarray(pts).reshape(-1, 2)
-                        color = map_colors[int(label) % len(map_colors)]
+                        color = pred_map_colors[
+                            int(label) % len(pred_map_colors)]
                         ax.plot(pts[:, 0], pts[:, 1], color=color,
                                 linewidth=1, alpha=0.8, zorder=1)
                         ax.scatter(pts[:, 0], pts[:, 1], color=color,
@@ -571,7 +586,8 @@ class VAD(MVXTwoStageDetector):
                     ego_traj = np.cumsum(ego_traj[..., :2], axis=-2)
                     ego_traj = np.concatenate(
                         [np.zeros((1, 2)), ego_traj], axis=0)
-                    draw_traj(ax, ego_traj, 'winter', 2.2)
+                    # 预测自车轨迹使用紫红渐变，与 GT 的蓝绿渐变区分。
+                    draw_traj(ax, ego_traj, 'plasma', 2.2)
 
                     ax.set(xlim=(-15, 15), ylim=(-30, 30),
                            xlabel='x / m', ylabel='y / m')
@@ -625,7 +641,8 @@ class VAD(MVXTwoStageDetector):
                     # GT 绘制在同一画布的右侧子图。
                     for pts, label in zip(gt_map_pts_np, gt_map_labels_np):
                         pts = np.asarray(pts).reshape(-1, 2)
-                        color = map_colors[int(label) % len(map_colors)]
+                        color = gt_map_colors[
+                            int(label) % len(gt_map_colors)]
                         gt_ax.plot(pts[:, 0], pts[:, 1], color=color,
                                    linewidth=1, alpha=0.8, zorder=1)
                         gt_ax.scatter(pts[:, 0], pts[:, 1], color=color,
@@ -681,10 +698,12 @@ class VAD(MVXTwoStageDetector):
                         'sample_idx: {}    frame_idx: {}'.format(
                             sample_idx, frame_idx),
                         fontsize=10)
-                    fig.tight_layout(rect=(0, 0, 1, 0.95), pad=1.0)
+                    # 手动控制边距，避免 tight_layout 拉开相机子图间距。
+                    fig.subplots_adjust(
+                        left=0.005, right=0.995, bottom=0.04, top=0.88)
                     fig.savefig(
                         os.path.join(scene_vis_dir, frame_name + '.png'),
-                        bbox_inches='tight', dpi=200)
+                        bbox_inches='tight', dpi=vis_dpi)
                     plt.close(fig)
                 except Exception as error:
                     warnings.warn(
