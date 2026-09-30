@@ -14,3 +14,8 @@ python tools/analysis_tools/visualization.py \
 
 python /home/wys/wsl/forks/VAD/scripts/create_scene_videos.py \
     --input-dir 
+
+
+python /vepfs-mlp2/c20250502/haoce/wangyushen/VAD/tools/get_preds.py \
+    /vepfs-mlp2/c20250502/haoce/wangyushen/VAD/projects/configs/VAD/VAD_base_stage_2_custom.py \
+    /c20250502/wangyushen/Weights/vad/VAD_base.pth

@@ -2,18 +2,10 @@
 import os
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
-
-# 需要放在可能导入 transformers 的模块之前。
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 
-warnings.filterwarnings(
-    'ignore',
-    message=r'On January 1, 2023, MMCV will release v2\.0\.0.*'
-)
-warnings.filterwarnings(
-    'ignore',
-    message=r'The arguments `.*` in BaseTransformerLayer has been deprecated.*'
-)
+warnings.filterwarnings('ignore', message=r'On January 1, 2023, MMCV will release v2\.0\.0.*')
+warnings.filterwarnings('ignore', message=r'The arguments `.*` in BaseTransformerLayer has been deprecated.*')
 
 import argparse
 import copy
