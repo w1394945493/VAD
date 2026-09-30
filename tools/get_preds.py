@@ -13,9 +13,16 @@ import importlib
 import os.path as osp
 import sys
 import torch
+import numpy as np
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.collections import LineCollection
 
 from mmcv import Config, DictAction
-from mmcv.parallel import MMDataParallel
+from mmcv.parallel import DataContainer, MMDataParallel
 from mmcv.runner import load_checkpoint
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
@@ -25,6 +32,169 @@ from mmdet3d.models import build_model
 sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
 
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
+
+
+def visualize_result(result, data, split, vis_root, score_thr, map_thr):
+    """绘制六路图像、预测 BEV 和 GT BEV，仅用于快速调试。"""
+    class_names = [
+        'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+        'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+
+    def unpack(value):
+        while True:
+            if isinstance(value, DataContainer):
+                value = value.data
+            elif isinstance(value, (list, tuple)) and len(value) == 1:
+                value = value[0]
+            else:
+                return value
+
+    def array(value):
+        value = unpack(value)
+        if hasattr(value, 'detach'):
+            value = value.detach().cpu()
+        return value.numpy() if hasattr(value, 'numpy') else np.asarray(value)
+
+    def draw_traj(ax, points, cmap_name, width, alpha=1.0):
+        points = np.asarray(points)
+        if len(points) < 2:
+            return
+        segments = np.stack([points[:-1], points[1:]], axis=1)
+        colors = cm.get_cmap(cmap_name)(np.linspace(0.15, 0.95, len(segments)))
+        colors[:, 3] *= alpha
+        ax.add_collection(LineCollection(
+            segments, colors=colors, linewidths=width, zorder=5))
+
+    def draw_box(ax, box, color, width=1.2):
+        x, y, w, length, yaw = box[0], box[1], box[3], box[4], box[6]
+        corners = np.array([
+            [-w / 2, -length / 2], [-w / 2, length / 2],
+            [w / 2, length / 2], [w / 2, -length / 2],
+            [-w / 2, -length / 2]])
+        rotation = np.array([
+            [np.cos(yaw), -np.sin(yaw)],
+            [np.sin(yaw), np.cos(yaw)]])
+        corners = corners @ rotation.T + [x, y]
+        ax.plot(corners[:, 0], corners[:, 1], color=color,
+                linewidth=width, zorder=3)
+
+    meta = unpack(data['img_metas'])
+    pred = result[0]['pts_bbox']
+    boxes = array(pred['boxes_3d'].tensor)
+    scores = array(pred['scores_3d'])
+    labels = array(pred['labels_3d']).astype(np.int64)
+    trajs = array(pred['trajs_3d'])
+    map_scores = array(pred['map_scores_3d'])
+    map_labels = array(pred['map_labels_3d']).astype(np.int64)
+    map_pts = array(pred['map_pts_3d'])
+    ego_preds = np.squeeze(array(pred['ego_fut_preds']))
+    ego_cmd = np.squeeze(array(pred['ego_fut_cmd'])).reshape(-1)
+
+    gt_boxes_obj = unpack(data['gt_bboxes_3d'])
+    gt_boxes = array(gt_boxes_obj.tensor)
+    gt_labels = array(data['gt_labels_3d']).astype(np.int64)
+    gt_attr = array(data['gt_attr_labels'])
+    gt_offsets = gt_attr[:, :12].reshape(-1, 6, 2)
+    gt_masks = gt_attr[:, 12:18]
+    ego_gt = np.squeeze(array(data['ego_fut_trajs'])).reshape(-1, 2)
+    fut_valid = bool(np.squeeze(array(data['fut_valid_flag'])))
+
+    gt_map_obj = unpack(data.get('map_gt_bboxes_3d'))
+    gt_map_label_obj = unpack(data.get('map_gt_labels_3d'))
+    if gt_map_obj is not None and hasattr(gt_map_obj, 'fixed_num_sampled_points'):
+        gt_map_pts = array(gt_map_obj.fixed_num_sampled_points)
+        gt_map_labels = array(gt_map_label_obj).astype(np.int64)
+    else:
+        gt_map_pts = np.empty((0, 0, 2), dtype=np.float32)
+        gt_map_labels = np.empty((0,), dtype=np.int64)
+
+    scene_token = str(meta['scene_token'])
+    frame_idx = int(meta['frame_idx'])
+    sample_idx = str(meta['sample_idx'])
+    scene_dir = osp.join(vis_root, split, scene_token)
+    os.makedirs(scene_dir, exist_ok=True)
+
+    fig = plt.figure(figsize=(16, 4.8))
+    grid = fig.add_gridspec(1, 3, width_ratios=[5.4, 1, 1], wspace=0.04)
+    camera_grid = grid[0].subgridspec(2, 3, wspace=0.01, hspace=0.01)
+    camera_axes = [fig.add_subplot(camera_grid[r, c])
+                   for r in range(2) for c in range(3)]
+    pred_ax = fig.add_subplot(grid[1])
+    gt_ax = fig.add_subplot(grid[2], sharex=pred_ax, sharey=pred_ax)
+
+    camera_names = [
+        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+        'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    for ax, name, index in zip(camera_axes, camera_names, [2, 0, 1, 4, 3, 5]):
+        ax.imshow(plt.imread(meta['filename'][index]))
+        ax.text(0.01, 0.97, name, transform=ax.transAxes, va='top',
+                color='white', fontsize=7,
+                bbox=dict(facecolor='black', alpha=0.45, edgecolor='none'))
+        ax.axis('off')
+
+    pred_map_colors = ['darkorange', 'goldenrod', 'tomato']
+    for pts, score, label in zip(map_pts, map_scores, map_labels):
+        if score >= map_thr:
+            pts = np.asarray(pts).reshape(-1, 2)
+            color = pred_map_colors[int(label) % 3]
+            pred_ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1)
+            pred_ax.scatter(pts[:, 0], pts[:, 1], color=color, s=2)
+
+    for box, score, label, modes in zip(boxes, scores, labels, trajs):
+        if score < score_thr:
+            continue
+        draw_box(pred_ax, box, 'tomato')
+        name = class_names[int(label)] if 0 <= int(label) < len(class_names) else str(label)
+        pred_ax.text(box[0], box[1], f'{name} {score:.2f}',
+                     color='darkred', fontsize=6)
+        for offsets in np.asarray(modes).reshape(-1, 6, 2):
+            points = np.cumsum(offsets, axis=0) + box[:2]
+            draw_traj(pred_ax, np.vstack([box[:2], points]), 'autumn', 1, 0.65)
+
+    gt_map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
+    for pts, label in zip(gt_map_pts, gt_map_labels):
+        pts = np.asarray(pts).reshape(-1, 2)
+        color = gt_map_colors[int(label) % 3]
+        gt_ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1)
+        gt_ax.scatter(pts[:, 0], pts[:, 1], color=color, s=2)
+
+    for box, label, offsets, mask in zip(
+            gt_boxes, gt_labels, gt_offsets, gt_masks):
+        draw_box(gt_ax, box, 'dodgerblue', 1.4)
+        name = class_names[int(label)] if 0 <= int(label) < len(class_names) else str(label)
+        gt_ax.text(box[0], box[1], name, color='navy', fontsize=6)
+        valid_steps = int(mask.sum())
+        if valid_steps:
+            points = np.cumsum(offsets[:valid_steps], axis=0) + box[:2]
+            draw_traj(gt_ax, np.vstack([box[:2], points]), 'summer', 1.6)
+
+    ego_box = np.array([[-0.9, -2], [-0.9, 2], [0.9, 2],
+                        [0.9, -2], [-0.9, -2]])
+    for ax in [pred_ax, gt_ax]:
+        ax.plot(ego_box[:, 0], ego_box[:, 1], color='mediumseagreen', linewidth=1.2)
+        ax.plot([0, 0], [0, 2], color='mediumseagreen', linewidth=1.2)
+        ax.set(xlim=(-15, 15), ylim=(-30, 30), xlabel='x / m', ylabel='y / m')
+        ax.set_aspect('equal')
+        ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
+
+    cmd_idx = int(np.argmax(ego_cmd))
+    ego_pred = ego_preds if ego_preds.ndim == 2 else ego_preds[cmd_idx]
+    draw_traj(pred_ax, np.vstack([np.zeros(2), np.cumsum(ego_pred, axis=0)]),
+              'plasma', 2.2)
+    draw_traj(gt_ax, np.vstack([np.zeros(2), np.cumsum(ego_gt, axis=0)]),
+              'winter', 2.2)
+    pred_ax.set_title(
+        f'Prediction\nobjects {int((scores >= score_thr).sum())}/{len(scores)}, '
+        f'maps {int((map_scores >= map_thr).sum())}/{len(map_scores)}', fontsize=8)
+    gt_ax.set_title(
+        f'Ground truth\nobjects {len(gt_boxes)}, maps {len(gt_map_pts)}, '
+        f'ego valid {fut_valid}', fontsize=8)
+    fig.suptitle(f'Sample Token: {sample_idx}    |    Frame Number: {frame_idx}',
+                 fontsize=8)
+    fig.subplots_adjust(left=0.005, right=0.995, bottom=0.04, top=0.88)
+    fig.savefig(osp.join(scene_dir, f'frame_{frame_idx:03d}.png'),
+                bbox_inches='tight', dpi=100)
+    plt.close(fig)
 
 
 def print_metrics(split, metrics):
@@ -68,6 +238,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # 可视化已移到本脚本，避免模型内部重复绘图。
+    os.environ.pop('VAD_DEBUG_VIS_DIR', None)
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
@@ -114,8 +286,13 @@ def main():
     print(f'验证集：{len(val_dataset)} 帧，{len(val_loader)} 个 batch')
     print('模型与权重加载完成。')
 
-    # 调试阶段只跑前 N 帧；保持数据顺序，以正确复用同一场景的历史 BEV。
+    # 调试参数直接固定在脚本中。
     N = 10
+    SCORE_THR = 0.3
+    MAP_THR = 0.3
+    VIS_ROOT = 'out/pred_vis'
+    os.makedirs(osp.join(VIS_ROOT, 'train'), exist_ok=True)
+    os.makedirs(osp.join(VIS_ROOT, 'val'), exist_ok=True)
 
     train_metrics = []
     model.module.prev_frame_info['scene_token'] = None
@@ -123,6 +300,7 @@ def main():
     for i, data in enumerate(train_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
+        visualize_result(result, data, 'train', VIS_ROOT, SCORE_THR, MAP_THR)
         train_metrics.append(result[0]['metric_results'])
         print(f'\rtrain: {i + 1}/{min(N, len(train_loader))}', end='', flush=True)
         if i + 1 >= N:
@@ -135,11 +313,13 @@ def main():
     for i, data in enumerate(val_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
+        visualize_result(result, data, 'val', VIS_ROOT, SCORE_THR, MAP_THR)
         val_metrics.append(result[0]['metric_results'])
         print(f'\rval: {i + 1}/{min(N, len(val_loader))}', end='', flush=True)
         if i + 1 >= N:
             break
     print_metrics('Val', val_metrics)
+    print(f'\n调试可视化已保存到：{VIS_ROOT}')
 
 
 if __name__ == '__main__':
