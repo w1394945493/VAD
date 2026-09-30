@@ -49,6 +49,9 @@ def main():
     train_cfg.test_mode = True
     val_cfg = copy.deepcopy(cfg.data.val)
     val_cfg.test_mode = True
+    # samples_per_gpu 属于 dataloader，不能传给 Dataset 构造函数。
+    train_cfg.pop('samples_per_gpu', None)
+    val_cfg.pop('samples_per_gpu', None)
 
     train_dataset = build_dataset(train_cfg)
     val_dataset = build_dataset(val_cfg)
