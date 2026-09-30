@@ -457,11 +457,17 @@ class VAD(MVXTwoStageDetector):
                         ax.add_collection(LineCollection(
                             segments, colors=colors, linewidths=width, zorder=5))
 
-                    os.makedirs(debug_vis_dir, exist_ok=True)
-                    frame_id = str(img_metas[0].get(
-                        'sample_idx', img_metas[0].get('token', 'frame')))
-                    frame_id = ''.join(
-                        c if c.isalnum() or c in '-_' else '_' for c in frame_id)
+                    # 每个 scene 使用独立目录，帧文件按场景内 frame_idx 排序。
+                    sample_idx = str(img_metas[0]['sample_idx'])
+                    scene_token = str(img_metas[0]['scene_token'])
+                    frame_idx = int(img_metas[0]['frame_idx'])
+                    safe_scene_token = ''.join(
+                        c if c.isalnum() or c in '-_' else '_'
+                        for c in scene_token)
+                    scene_vis_dir = os.path.join(
+                        debug_vis_dir, safe_scene_token)
+                    os.makedirs(scene_vis_dir, exist_ok=True)
+                    frame_name = 'frame_{:03d}'.format(frame_idx)
 
                     boxes = to_numpy(vis_bbox_result['boxes_3d'].tensor)
                     scores = to_numpy(vis_bbox_result['scores_3d'])
@@ -475,15 +481,38 @@ class VAD(MVXTwoStageDetector):
                     ego_cmd_np = to_numpy(vis_bbox_result['ego_fut_cmd'])
 
                     # 同名 NPZ 保存纯数组，可复制到无 mmdet3d 的机器离线重画。
-                    np.savez_compressed(
-                        os.path.join(debug_vis_dir, frame_id + '.npz'),
-                        boxes_3d=boxes, scores_3d=scores, labels_3d=labels,
-                        trajs_3d=trajs, map_scores_3d=map_scores,
-                        map_labels_3d=map_labels, map_pts_3d=map_pts,
-                        ego_fut_preds=ego_preds_np, ego_fut_cmd=ego_cmd_np,
-                        class_names=np.asarray(mapped_class_names))
+                    # np.savez_compressed(
+                    #     os.path.join(scene_vis_dir, frame_name + '_pred.npz'),
+                    #     boxes_3d=boxes, scores_3d=scores, labels_3d=labels,
+                    #     trajs_3d=trajs, map_scores_3d=map_scores,
+                    #     map_labels_3d=map_labels, map_pts_3d=map_pts,
+                    #     ego_fut_preds=ego_preds_np, ego_fut_cmd=ego_cmd_np,
+                    #     class_names=np.asarray(mapped_class_names))
 
-                    fig, ax = plt.subplots(1, 1, figsize=(6, 12))
+                    # 左侧 2x3 环视图，中间预测 BEV，右侧 GT BEV。
+                    fig = plt.figure(figsize=(24, 10))
+                    grid = fig.add_gridspec(
+                        2, 5, width_ratios=[1, 1, 1, 1.1, 1.1])
+                    camera_axes = [
+                        fig.add_subplot(grid[row, col])
+                        for row in range(2) for col in range(3)]
+                    ax = fig.add_subplot(grid[:, 3])
+                    gt_ax = fig.add_subplot(
+                        grid[:, 4], sharex=ax, sharey=ax)
+
+                    # filename 的原始顺序为 FRONT、FRONT_RIGHT、FRONT_LEFT、
+                    # BACK、BACK_LEFT、BACK_RIGHT；这里调整为更直观的环视布局。
+                    camera_names = [
+                        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
+                        'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+                    camera_order = [2, 0, 1, 4, 3, 5]
+                    image_paths = img_metas[0]['filename']
+                    for camera_ax, camera_name, camera_index in zip(
+                            camera_axes, camera_names, camera_order):
+                        camera_ax.imshow(plt.imread(image_paths[camera_index]))
+                        camera_ax.set_title(camera_name, fontsize=9)
+                        camera_ax.axis('off')
+
                     map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
                     for pts, score, label in zip(
                             map_pts, map_scores, map_labels):
@@ -549,16 +578,14 @@ class VAD(MVXTwoStageDetector):
                     ax.set_aspect('equal')
                     ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
                     ax.set_title(
-                        'VAD prediction: {}\nobjects {}/{} (>{:.2f}), maps {}/{} (>{:.2f})'.format(
-                            frame_id, int((scores >= vis_score_threshold).sum()),
+                        'Prediction\nobjects {}/{} (>{:.2f}), maps {}/{} (>{:.2f})'.format(
+                            int((scores >= vis_score_threshold).sum()),
                             len(scores), vis_score_threshold,
                             int((map_scores >= vis_map_threshold).sum()),
                             len(map_scores), vis_map_threshold))
-                    fig.tight_layout()
-                    fig.savefig(
-                        os.path.join(debug_vis_dir, frame_id + '.png'),
-                        bbox_inches='tight', dpi=200)
-                    plt.close(fig)
+
+                    #* -----------------------------------------#
+                    #* 可视化真值
                     # 整理并保存当前函数能够取得的全部 GT。
                     def unwrap_singleton(value):
                         while isinstance(value, (list, tuple)) and len(value) == 1:
@@ -586,16 +613,16 @@ class VAD(MVXTwoStageDetector):
                         gt_map_labels_np = np.empty((0,), dtype=np.int64)
 
                     ego_gt_np = to_numpy(ego_fut_trajs[0, 0])
-                    np.savez_compressed(
-                        os.path.join(debug_vis_dir, frame_id + '_gt.npz'),
-                        boxes_3d=gt_boxes_np, labels_3d=gt_labels_np,
-                        traj_offsets=gt_offsets_np, traj_masks=gt_masks_np,
-                        map_pts_3d=gt_map_pts_np,
-                        map_labels_3d=gt_map_labels_np,
-                        ego_fut_traj=ego_gt_np,
-                        class_names=np.asarray(mapped_class_names))
+                    # np.savez_compressed(
+                    #     os.path.join(scene_vis_dir, frame_name + '_gt.npz'),
+                    #     boxes_3d=gt_boxes_np, labels_3d=gt_labels_np,
+                    #     traj_offsets=gt_offsets_np, traj_masks=gt_masks_np,
+                    #     map_pts_3d=gt_map_pts_np,
+                    #     map_labels_3d=gt_map_labels_np,
+                    #     ego_fut_traj=ego_gt_np,
+                    #     class_names=np.asarray(mapped_class_names))
 
-                    gt_fig, gt_ax = plt.subplots(1, 1, figsize=(6, 12))
+                    # GT 绘制在同一画布的右侧子图。
                     for pts, label in zip(gt_map_pts_np, gt_map_labels_np):
                         pts = np.asarray(pts).reshape(-1, 2)
                         color = map_colors[int(label) % len(map_colors)]
@@ -645,14 +672,20 @@ class VAD(MVXTwoStageDetector):
                     gt_ax.set_aspect('equal')
                     gt_ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
                     gt_ax.set_title(
-                        'VAD ground truth: {}\nobjects {}, maps {}, ego valid {}'.format(
-                            frame_id, len(gt_boxes_np), len(gt_map_pts_np),
+                        'Ground truth\nobjects {}, maps {}, ego valid {}'.format(
+                            len(gt_boxes_np), len(gt_map_pts_np),
                             bool(fut_valid_flag)))
-                    gt_fig.tight_layout()
-                    gt_fig.savefig(
-                        os.path.join(debug_vis_dir, frame_id + '_gt.png'),
+
+                    # 总标题同时显示当前帧 token 和场景内整数帧号。
+                    fig.suptitle(
+                        'sample_idx: {}    frame_idx: {}'.format(
+                            sample_idx, frame_idx),
+                        fontsize=10)
+                    fig.tight_layout(rect=(0, 0, 1, 0.95), pad=1.0)
+                    fig.savefig(
+                        os.path.join(scene_vis_dir, frame_name + '.png'),
                         bbox_inches='tight', dpi=200)
-                    plt.close(gt_fig)
+                    plt.close(fig)
                 except Exception as error:
                     warnings.warn(
                         'VAD debug visualization failed: {}'.format(error))

@@ -128,7 +128,7 @@ class PadMultiViewImage(object):
         elif self.size_divisor is not None:
             padded_img = [mmcv.impad_to_multiple(
                 img, self.size_divisor, pad_val=self.pad_val) for img in results['img']]
-        
+
         results['ori_shape'] = [img.shape for img in results['img']]
         results['img'] = padded_img
         results['img_shape'] = [img.shape for img in padded_img]
@@ -339,15 +339,29 @@ class CustomCollect3D(object):
 
     def __init__(self,
                  keys,
-                 meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
-                            'depth2img', 'cam2img', 'pad_shape',
-                            'scale_factor', 'flip', 'pcd_horizontal_flip',
-                            'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
-                            'img_norm_cfg', 'pcd_trans', 'sample_idx', 'prev_idx', 'next_idx',
-                            'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
-                            'transformation_3d_flow', 'scene_token',
-                            'can_bus',
-                            )):
+                 meta_keys=(
+                     'filename',              # 多相机图像文件路径。
+                     'ori_shape', 'img_shape', # 原始尺寸、当前处理后的图像尺寸。
+                     'lidar2img',              # LiDAR 点投影到各相机图像的变换矩阵。
+                     'depth2img', 'cam2img',   # 深度/相机坐标投影到图像的矩阵。
+                     'pad_shape',              # 图像 padding 后的尺寸。
+                     'scale_factor', 'flip',   # 图像缩放比例及是否执行翻转。
+                     'pcd_horizontal_flip',    # 点云是否执行水平翻转。
+                     'pcd_vertical_flip',      # 点云是否执行垂直翻转。
+                     'box_mode_3d',            # 3D 框坐标模式，如 LiDAR/Camera/Depth。
+                     'box_type_3d',            # 构造 3D 框对象所使用的类型。
+                     'img_norm_cfg',           # 图像归一化的均值、方差及通道顺序。
+                     'pcd_trans',              # 数据增强施加给点云的平移量。
+                     'sample_idx',             # 当前关键帧的 nuScenes sample token。
+                     'prev_idx', 'next_idx',   # 同一场景上一/下一关键帧的 sample token。
+                     'frame_idx',              # 当前关键帧的场景内帧号，从0开始
+                     'pcd_scale_factor',       # 数据增强施加给点云的缩放比例。
+                     'pcd_rotation',           # 数据增强施加给点云的旋转矩阵。
+                     'pts_filename',           # 当前帧点云文件路径。
+                     'transformation_3d_flow', # 已执行的 3D 数据增强操作及其顺序。
+                     'scene_token',            # 当前帧所属场景的 nuScenes scene token。
+                     'can_bus',                # 自车位置、姿态及运动状态等 CAN bus 特征。
+                 )):
         self.keys = keys
         self.meta_keys = meta_keys
 
@@ -361,10 +375,10 @@ class CustomCollect3D(object):
                 - keys in ``self.keys``
                 - ``img_metas``
         """
-       
+
         data = {}
         img_metas = {}
-      
+
         for key in self.meta_keys:
             if key in results:
                 img_metas[key] = results[key]
@@ -421,7 +435,7 @@ class RandomScaleImageMultiViewImage(object):
         repr_str = self.__class__.__name__
         repr_str += f'(size={self.scales}, '
         return repr_str
-    
+
 
 @PIPELINES.register_module()
 class CustomPointsRangeFilter:
