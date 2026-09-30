@@ -260,6 +260,8 @@ class VAD(MVXTwoStageDetector):
         img_metas,
         gt_bboxes_3d,
         gt_labels_3d,
+        map_gt_bboxes_3d=None,
+        map_gt_labels_3d=None,
         img=None,
         ego_his_trajs=None,
         ego_fut_trajs=None,
@@ -300,6 +302,8 @@ class VAD(MVXTwoStageDetector):
             prev_bev=self.prev_frame_info['prev_bev'],
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
+            map_gt_bboxes_3d=map_gt_bboxes_3d,
+            map_gt_labels_3d=map_gt_labels_3d,
             ego_his_trajs=ego_his_trajs[0],
             ego_fut_trajs=ego_fut_trajs[0],
             ego_fut_cmd=ego_fut_cmd[0],
@@ -319,6 +323,8 @@ class VAD(MVXTwoStageDetector):
         img_metas,
         gt_bboxes_3d,
         gt_labels_3d,
+        map_gt_bboxes_3d=None,
+        map_gt_labels_3d=None,
         img=None,
         prev_bev=None,
         points=None,
@@ -340,6 +346,8 @@ class VAD(MVXTwoStageDetector):
             gt_bboxes_3d,
             gt_labels_3d,
             prev_bev,
+            map_gt_bboxes_3d=map_gt_bboxes_3d,
+            map_gt_labels_3d=map_gt_labels_3d,
             fut_valid_flag=fut_valid_flag,
             rescale=rescale,
             start=None,
@@ -362,6 +370,8 @@ class VAD(MVXTwoStageDetector):
         gt_bboxes_3d,
         gt_labels_3d,
         prev_bev=None,
+        map_gt_bboxes_3d=None,
+        map_gt_labels_3d=None,
         fut_valid_flag=None,
         rescale=False,
         start=None,
@@ -399,6 +409,10 @@ class VAD(MVXTwoStageDetector):
             c_bbox_results = copy.deepcopy(bbox_results)  # 避免评测过滤改动原结果。
 
             bbox_result = c_bbox_results[0]  # 取 batch 中唯一的预测结果。
+            # 可视化使用未经过运动评测阈值过滤的预测，避免调试图只剩自车。
+            debug_vis_dir = os.getenv('VAD_DEBUG_VIS_DIR')
+            vis_bbox_result = (
+                copy.deepcopy(bbox_result) if debug_vis_dir else None)
             gt_bbox = gt_bboxes_3d[0][0]  # 当前帧真值 3D 框。
             gt_label = gt_labels_3d[0][0].to('cpu')  # 真值类别移至 CPU。
             gt_attr_label = gt_attr_labels[0][0].to('cpu')  # 真值未来属性移至 CPU。
@@ -410,9 +424,13 @@ class VAD(MVXTwoStageDetector):
             bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]  # 同步过滤类别。
             bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]  # 同步过滤目标轨迹。
 
-            # 调试可视化：设置 VAD_DEBUG_VIS_DIR 后才执行，默认不影响测试。
-            debug_vis_dir = os.getenv('VAD_DEBUG_VIS_DIR')
+            # *=================================================#
+            # 调试可视化阈值独立于指标阈值，默认均为 0.3。
             if debug_vis_dir:
+                vis_score_threshold = float(
+                    os.getenv('VAD_DEBUG_SCORE_THRESHOLD', '0.3'))
+                vis_map_threshold = float(
+                    os.getenv('VAD_DEBUG_MAP_THRESHOLD', '0.3'))
                 try:
                     import matplotlib
                     matplotlib.use('Agg')
@@ -445,16 +463,16 @@ class VAD(MVXTwoStageDetector):
                     frame_id = ''.join(
                         c if c.isalnum() or c in '-_' else '_' for c in frame_id)
 
-                    boxes = to_numpy(bbox_result['boxes_3d'].tensor)
-                    scores = to_numpy(bbox_result['scores_3d'])
-                    labels = to_numpy(bbox_result['labels_3d']).astype(np.int64)
-                    trajs = to_numpy(bbox_result['trajs_3d'])
-                    map_scores = to_numpy(bbox_result['map_scores_3d'])
+                    boxes = to_numpy(vis_bbox_result['boxes_3d'].tensor)
+                    scores = to_numpy(vis_bbox_result['scores_3d'])
+                    labels = to_numpy(vis_bbox_result['labels_3d']).astype(np.int64)
+                    trajs = to_numpy(vis_bbox_result['trajs_3d'])
+                    map_scores = to_numpy(vis_bbox_result['map_scores_3d'])
                     map_labels = to_numpy(
-                        bbox_result['map_labels_3d']).astype(np.int64)
-                    map_pts = to_numpy(bbox_result['map_pts_3d'])
-                    ego_preds_np = to_numpy(bbox_result['ego_fut_preds'])
-                    ego_cmd_np = to_numpy(bbox_result['ego_fut_cmd'])
+                        vis_bbox_result['map_labels_3d']).astype(np.int64)
+                    map_pts = to_numpy(vis_bbox_result['map_pts_3d'])
+                    ego_preds_np = to_numpy(vis_bbox_result['ego_fut_preds'])
+                    ego_cmd_np = to_numpy(vis_bbox_result['ego_fut_cmd'])
 
                     # 同名 NPZ 保存纯数组，可复制到无 mmdet3d 的机器离线重画。
                     np.savez_compressed(
@@ -469,7 +487,7 @@ class VAD(MVXTwoStageDetector):
                     map_colors = ['cornflowerblue', 'royalblue', 'slategrey']
                     for pts, score, label in zip(
                             map_pts, map_scores, map_labels):
-                        if score < 0.6:
+                        if score < vis_map_threshold:
                             continue
                         pts = np.asarray(pts).reshape(-1, 2)
                         color = map_colors[int(label) % len(map_colors)]
@@ -481,6 +499,8 @@ class VAD(MVXTwoStageDetector):
                     # 绘制目标 BEV 框、类别/分数及全部未来轨迹模态。
                     for box, score, label, obj_trajs in zip(
                             boxes, scores, labels, trajs):
+                        if score < vis_score_threshold:
+                            continue
                         x, y, width, length, yaw = (
                             box[0], box[1], box[3], box[4], box[6])
                         local = np.array([
@@ -528,16 +548,115 @@ class VAD(MVXTwoStageDetector):
                            xlabel='x / m', ylabel='y / m')
                     ax.set_aspect('equal')
                     ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
-                    ax.set_title('VAD prediction: {}'.format(frame_id))
+                    ax.set_title(
+                        'VAD prediction: {}\nobjects {}/{} (>{:.2f}), maps {}/{} (>{:.2f})'.format(
+                            frame_id, int((scores >= vis_score_threshold).sum()),
+                            len(scores), vis_score_threshold,
+                            int((map_scores >= vis_map_threshold).sum()),
+                            len(map_scores), vis_map_threshold))
                     fig.tight_layout()
                     fig.savefig(
                         os.path.join(debug_vis_dir, frame_id + '.png'),
                         bbox_inches='tight', dpi=200)
                     plt.close(fig)
+                    # 整理并保存当前函数能够取得的全部 GT。
+                    def unwrap_singleton(value):
+                        while isinstance(value, (list, tuple)) and len(value) == 1:
+                            value = value[0]
+                        return value
+
+                    gt_boxes_np = to_numpy(gt_bbox.tensor)
+                    gt_labels_np = to_numpy(gt_label).astype(np.int64)
+                    gt_attr_np = to_numpy(gt_attr_label)
+                    gt_offsets_np = gt_attr_np[:, :self.fut_ts * 2].reshape(
+                        -1, self.fut_ts, 2)
+                    gt_masks_np = gt_attr_np[
+                        :, self.fut_ts * 2:self.fut_ts * 3]
+
+                    gt_map_obj = unwrap_singleton(map_gt_bboxes_3d)
+                    gt_map_label_obj = unwrap_singleton(map_gt_labels_3d)
+                    if (gt_map_obj is not None and
+                            hasattr(gt_map_obj, 'fixed_num_sampled_points')):
+                        gt_map_pts_np = to_numpy(
+                            gt_map_obj.fixed_num_sampled_points)
+                        gt_map_labels_np = to_numpy(
+                            gt_map_label_obj).astype(np.int64)
+                    else:
+                        gt_map_pts_np = np.empty((0, 0, 2), dtype=np.float32)
+                        gt_map_labels_np = np.empty((0,), dtype=np.int64)
+
+                    ego_gt_np = to_numpy(ego_fut_trajs[0, 0])
+                    np.savez_compressed(
+                        os.path.join(debug_vis_dir, frame_id + '_gt.npz'),
+                        boxes_3d=gt_boxes_np, labels_3d=gt_labels_np,
+                        traj_offsets=gt_offsets_np, traj_masks=gt_masks_np,
+                        map_pts_3d=gt_map_pts_np,
+                        map_labels_3d=gt_map_labels_np,
+                        ego_fut_traj=ego_gt_np,
+                        class_names=np.asarray(mapped_class_names))
+
+                    gt_fig, gt_ax = plt.subplots(1, 1, figsize=(6, 12))
+                    for pts, label in zip(gt_map_pts_np, gt_map_labels_np):
+                        pts = np.asarray(pts).reshape(-1, 2)
+                        color = map_colors[int(label) % len(map_colors)]
+                        gt_ax.plot(pts[:, 0], pts[:, 1], color=color,
+                                   linewidth=1, alpha=0.8, zorder=1)
+                        gt_ax.scatter(pts[:, 0], pts[:, 1], color=color,
+                                      s=2, alpha=0.8, zorder=1)
+
+                    for box, label, offsets, valid_mask in zip(
+                            gt_boxes_np, gt_labels_np, gt_offsets_np, gt_masks_np):
+                        x, y, width, length, yaw = (
+                            box[0], box[1], box[3], box[4], box[6])
+                        local = np.array([
+                            [-width / 2, -length / 2],
+                            [-width / 2, length / 2],
+                            [width / 2, length / 2],
+                            [width / 2, -length / 2],
+                            [-width / 2, -length / 2]])
+                        rotation = np.array([
+                            [np.cos(yaw), -np.sin(yaw)],
+                            [np.sin(yaw), np.cos(yaw)]])
+                        corners = local @ rotation.T + np.array([x, y])
+                        gt_ax.plot(corners[:, 0], corners[:, 1],
+                                   color='dodgerblue', linewidth=1.4, zorder=3)
+                        name = (mapped_class_names[int(label)]
+                                if 0 <= int(label) < len(mapped_class_names)
+                                else str(label))
+                        gt_ax.text(x, y, name, color='navy', fontsize=6, zorder=6)
+
+                        valid_steps = int(np.asarray(valid_mask).sum())
+                        if valid_steps > 0:
+                            coords = np.cumsum(offsets[:valid_steps], axis=0) + [x, y]
+                            coords = np.concatenate(
+                                [np.array([[x, y]]), coords], axis=0)
+                            draw_traj(gt_ax, coords, 'summer', 1.6)
+
+                    gt_ax.plot(ego_box[:, 0], ego_box[:, 1],
+                               color='mediumseagreen', linewidth=1.2)
+                    gt_ax.plot([0, 0], [0, 2], color='mediumseagreen',
+                               linewidth=1.2)
+                    ego_gt_coords = np.cumsum(ego_gt_np[..., :2], axis=-2)
+                    ego_gt_coords = np.concatenate(
+                        [np.zeros((1, 2)), ego_gt_coords], axis=0)
+                    draw_traj(gt_ax, ego_gt_coords, 'winter', 2.2)
+                    gt_ax.set(xlim=(-15, 15), ylim=(-30, 30),
+                              xlabel='x / m', ylabel='y / m')
+                    gt_ax.set_aspect('equal')
+                    gt_ax.grid(color='lightgray', linewidth=0.4, alpha=0.5)
+                    gt_ax.set_title(
+                        'VAD ground truth: {}\nobjects {}, maps {}, ego valid {}'.format(
+                            frame_id, len(gt_boxes_np), len(gt_map_pts_np),
+                            bool(fut_valid_flag)))
+                    gt_fig.tight_layout()
+                    gt_fig.savefig(
+                        os.path.join(debug_vis_dir, frame_id + '_gt.png'),
+                        bbox_inches='tight', dpi=200)
+                    plt.close(gt_fig)
                 except Exception as error:
                     warnings.warn(
                         'VAD debug visualization failed: {}'.format(error))
-
+            # *=================================================#
 
             matched_bbox_result = self.assign_pred_to_gt_vip3d(  # 将预测目标匹配至真值。
                 bbox_result, gt_bbox, gt_label)  # 输入过滤后的预测、真值框和类别。
