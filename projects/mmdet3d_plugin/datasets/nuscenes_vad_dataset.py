@@ -1962,8 +1962,9 @@ def output_to_nusc_box(detection):
     box_gravity_center = box3d.gravity_center.numpy()
     box_dims = box3d.dims.numpy()
     box_yaw = box3d.yaw.numpy()
-    # TODO: check whether this is necessary
-    # with dir_offset & dir_limit in the head
+    #! 预测 yaw 与 GT 使用相同的旧版 MMDetection3D 编码，导出 nuScenes Box 时也需恢复 yaw_nusc = -yaw_box - pi/2。
+    #! 下行表达式生成新数组并重新绑定 box_yaw，不是切片原地赋值，因此不会修改共享内存中的原预测框 Tensor。
+    #! 若直接使用 box3d.corners 绘图，则由框类解释原角度编码，调用方无需再做此转换。
     box_yaw = -box_yaw - np.pi / 2
 
     box_list = []

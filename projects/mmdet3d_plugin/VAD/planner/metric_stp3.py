@@ -102,7 +102,10 @@ class PlanningMetric():
         pedestrian = np.zeros((T,self.bev_dimension[0], self.bev_dimension[1]))
         agent_num = gt_agent_feats.shape[1]
 
-        gt_agent_boxes = gt_agent_boxes.tensor.cpu().numpy()  #(N, 9)
+        # gt_agent_boxes = gt_agent_boxes.tensor.cpu().numpy()  #(N, 9)
+        #! CPU Tensor 的 numpy() 共享原内存，后续原地转换 yaw 会污染输入 GT，导致前向后的可视化框朝向错误。
+        #! 使用 copy() 创建独立数组，使 yaw 转换仅作用于规划评测；detach() 本身不会复制内存。
+        gt_agent_boxes = gt_agent_boxes.tensor.detach().cpu().numpy().copy()  #(N, 9)
         gt_agent_feats = gt_agent_feats.cpu().numpy()
 
         gt_agent_fut_trajs = gt_agent_feats[..., :T*2].reshape(-1, 6, 2)
@@ -112,6 +115,9 @@ class PlanningMetric():
         gt_agent_fut_trajs = np.cumsum(gt_agent_fut_trajs, axis=1)
         gt_agent_fut_yaw = np.cumsum(gt_agent_fut_yaw, axis=1)
 
+        #! GT 保存的是旧版 MMDetection3D 的角度编码：yaw_box = -yaw_lidar - pi/2。
+        #! 下游 _get_poly_region_in_image 按车长沿局部 x 轴、逆时针旋转构造矩形，需恢复 yaw_lidar = -(yaw_box + pi/2)。
+        #! 这里只转换角度参数约定，中心坐标仍在同一 LiDAR 系；未来 yaw 增量也使用恢复后的角度约定。
         gt_agent_boxes[:,6:7] = -1*(gt_agent_boxes[:,6:7] + np.pi/2) # NOTE: convert yaw to lidar frame
         gt_agent_fut_trajs = gt_agent_fut_trajs + gt_agent_boxes[:, np.newaxis, 0:2]
         gt_agent_fut_yaw = gt_agent_fut_yaw + gt_agent_boxes[:, np.newaxis, 6:7]
