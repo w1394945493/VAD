@@ -65,22 +65,18 @@ def visualize_result(result, data, split, vis_root, score_thr, map_thr):
         ax.add_collection(LineCollection(
             segments, colors=colors, linewidths=width, zorder=5))
 
-    def draw_box(ax, box, color, width=1.2):
-        x, y, w, length, yaw = box[0], box[1], box[3], box[4], box[6]
-        corners = np.array([
-            [-w / 2, -length / 2], [-w / 2, length / 2],
-            [w / 2, length / 2], [w / 2, -length / 2],
-            [-w / 2, -length / 2]])
-        rotation = np.array([
-            [np.cos(yaw), -np.sin(yaw)],
-            [np.sin(yaw), np.cos(yaw)]])
-        corners = corners @ rotation.T + [x, y]
-        ax.plot(corners[:, 0], corners[:, 1], color=color,
+    def draw_box(ax, corners, color, width=1.2):
+        # 直接使用 mmdet3d 计算的底面角点，避免手算时混淆 w/l 和 yaw 约定。
+        bottom = corners[[0, 3, 7, 4, 0], :2]
+        ax.plot(bottom[:, 0], bottom[:, 1], color=color,
                 linewidth=width, zorder=3)
 
     meta = unpack(data['img_metas'])
     pred = result[0]['pts_bbox']
-    boxes = array(pred['boxes_3d'].tensor)
+    pred_boxes_obj = pred['boxes_3d']
+    boxes = array(pred_boxes_obj.tensor)
+    pred_corners = (array(pred_boxes_obj.corners) if len(pred_boxes_obj)
+                    else np.empty((0, 8, 3), dtype=np.float32))
     scores = array(pred['scores_3d'])
     labels = array(pred['labels_3d']).astype(np.int64)
     trajs = array(pred['trajs_3d'])
@@ -92,6 +88,8 @@ def visualize_result(result, data, split, vis_root, score_thr, map_thr):
 
     gt_boxes_obj = unpack(data['gt_bboxes_3d'])
     gt_boxes = array(gt_boxes_obj.tensor)
+    gt_corners = (array(gt_boxes_obj.corners) if len(gt_boxes_obj)
+                  else np.empty((0, 8, 3), dtype=np.float32))
     gt_labels = array(data['gt_labels_3d']).astype(np.int64)
     gt_attr = array(data['gt_attr_labels'])
     gt_offsets = gt_attr[:, :12].reshape(-1, 6, 2)
@@ -140,10 +138,11 @@ def visualize_result(result, data, split, vis_root, score_thr, map_thr):
             pred_ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1)
             pred_ax.scatter(pts[:, 0], pts[:, 1], color=color, s=2)
 
-    for box, score, label, modes in zip(boxes, scores, labels, trajs):
+    for box, corners, score, label, modes in zip(
+            boxes, pred_corners, scores, labels, trajs):
         if score < score_thr:
             continue
-        draw_box(pred_ax, box, 'tomato')
+        draw_box(pred_ax, corners, 'tomato')
         name = class_names[int(label)] if 0 <= int(label) < len(class_names) else str(label)
         pred_ax.text(box[0], box[1], f'{name} {score:.2f}',
                      color='darkred', fontsize=6)
@@ -158,9 +157,9 @@ def visualize_result(result, data, split, vis_root, score_thr, map_thr):
         gt_ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1)
         gt_ax.scatter(pts[:, 0], pts[:, 1], color=color, s=2)
 
-    for box, label, offsets, mask in zip(
-            gt_boxes, gt_labels, gt_offsets, gt_masks):
-        draw_box(gt_ax, box, 'dodgerblue', 1.4)
+    for box, corners, label, offsets, mask in zip(
+            gt_boxes, gt_corners, gt_labels, gt_offsets, gt_masks):
+        draw_box(gt_ax, corners, 'dodgerblue', 1.4)
         name = class_names[int(label)] if 0 <= int(label) < len(class_names) else str(label)
         gt_ax.text(box[0], box[1], name, color='navy', fontsize=6)
         valid_steps = int(mask.sum())
